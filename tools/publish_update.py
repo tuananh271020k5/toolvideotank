@@ -20,7 +20,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 GIST_REPO_DIR = ROOT_DIR / "scratch" / "gist_repo"
-GIST_URL = "https://gist.github.com/b298a331f107ac7f0cd2911cddc438f7.git"
+GIST_URL = "https://gist.github.com/afc6df7b58104974cc5ebde03952d631.git"
 VERSION_PY = ROOT_DIR / "app" / "version.py"
 
 
