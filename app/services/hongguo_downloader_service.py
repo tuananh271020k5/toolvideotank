@@ -75,7 +75,7 @@ def fetch_hongguo_drama_info(series_id_or_url: str, cookies: Optional[str] = Non
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
-    except Exception as exc:
+    except Exception:
         # Thử fallback sang detail URL
         detail_url = f"https://hongguoduanju.com/detail?series_id={series_id}"
         req_fallback = urllib.request.Request(detail_url, headers=headers)
@@ -199,7 +199,7 @@ def resolve_episode_video_url(series_id: str, vid: str, cookies: Optional[str] =
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
-    except Exception as exc:
+    except Exception:
         return None
 
     idx = html.find("_ROUTER_DATA =")

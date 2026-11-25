@@ -14,11 +14,8 @@ from __future__ import annotations
 import os
 import re
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QButtonGroup,
-    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -28,7 +25,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -982,6 +978,19 @@ class SubtitleListView(QWidget):
 
     def select_card(self, index: int, seek: bool = True):
         """Highlight card and optionally seek player and timeline."""
+        # ``gui.set_selected_segment_index`` calls back into this method to
+        # keep the list in sync.  Without this guard the two methods recursed
+        # until RecursionError (~1000 levels, each rescanning every row) on
+        # every playback cue change, freezing the UI on long projects.
+        if getattr(self, "_select_card_active", False):
+            return
+        self._select_card_active = True
+        try:
+            self._select_card_impl(index, seek)
+        finally:
+            self._select_card_active = False
+
+    def _select_card_impl(self, index: int, seek: bool):
         self._selected_index = index
         target_card = None
 

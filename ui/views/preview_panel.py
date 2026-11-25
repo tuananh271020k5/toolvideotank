@@ -1,6 +1,5 @@
 import os
 
-import os
 
 from PySide6 import QtCore
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
@@ -22,7 +21,6 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTabWidget,
     QTextEdit,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -93,7 +91,7 @@ def get_default_ocr_rect_for_video(video_path: str = "", main_window=None) -> tu
 
 
 class OcrRegionOverlay(QWidget):
-    _HANDLE_SIZE = 10
+    _HANDLE_SIZE = 12
     _MIN_W = 40
     _MIN_H = 10
 
@@ -115,20 +113,58 @@ class OcrRegionOverlay(QWidget):
         self._requested_visible = False
         self._editable = False
         self._drag_mode = ""
+        self._drag_target_box = "box1"  # "box1" hoặc "box2"
         self._drag_offset = QRectF()
         self._rect_on_press = QRectF()
         self._press_pos = QRectF()
-        self._norm = QRectF(0.12, 0.78, 0.76, 0.085)
+        self._norm = QRectF(0.08, 0.70, 0.84, 0.09)     # Khung OCR 1 (Mặc định ở đáy)
+        self._norm2 = QRectF(0.08, 0.09, 0.84, 0.085)   # Khung OCR 2 (Mặc định ở đỉnh)
         self._user_customized = False
         self._loaded_video_path = ""
+        # Chế độ khung OCR: 1 (Chỉ 1 khung đáy) hoặc 2 (2 khung: đỉnh và đáy)
+        from PySide6.QtCore import QSettings
+        init_mode = QSettings("TankVideo", "TankVideoStudio").value("ocr_box_mode", 1, type=int)
+        if init_mode not in (1, 2):
+            init_mode = 1
+        self._box_mode = init_mode
+        os.environ["OCR_BOX_MODE"] = str(self._box_mode)
         self._load_rect()
         self.hide()
 
+    def get_box_mode(self) -> int:
+        """Trả về 1 (1 khung) hoặc 2 (2 khung)."""
+        return getattr(self, "_box_mode", 1)
+
+    def set_box_mode(self, mode: int):
+        """Đặt chế độ 1 hoặc 2 khung OCR và cập nhật hiển thị tức thì."""
+        self._box_mode = 2 if mode == 2 else 1
+        os.environ["OCR_BOX_MODE"] = str(self._box_mode)
+        try:
+            from PySide6.QtCore import QSettings
+            QSettings("TankVideo", "TankVideoStudio").setValue("ocr_box_mode", self._box_mode)
+        except Exception:
+            pass
+        self.update()
+
     def get_norm_rect(self) -> tuple:
+        """Trả về (x, y, w, h) của Khung OCR 1 (Đáy)."""
         return (float(self._norm.x()), float(self._norm.y()), float(self._norm.width()), float(self._norm.height()))
+
+    def get_norm_rect_2(self) -> tuple:
+        """Trả về (x, y, w, h) của Khung OCR 2 (Đỉnh)."""
+        return (float(self._norm2.x()), float(self._norm2.y()), float(self._norm2.width()), float(self._norm2.height()))
+
+    def get_dual_norm_rects(self) -> tuple[tuple, tuple]:
+        """Trả về cả 2 khung OCR: (rect1_bottom, rect2_top)."""
+        return (self.get_norm_rect(), self.get_norm_rect_2())
 
     def set_norm_rect(self, x: float, y: float, w: float, h: float):
         self._norm = QRectF(x, y, w, h)
+        self._save_rect()
+        self.update()
+
+    def set_norm_rect_2(self, x: float, y: float, w: float, h: float):
+        self._norm2 = QRectF(x, y, w, h)
         self._save_rect()
         self.update()
 
@@ -201,58 +237,62 @@ class OcrRegionOverlay(QWidget):
                 except Exception:
                     pass
 
+        rect_tuple_2 = None
         if rect_tuple and len(rect_tuple) == 4:
             self._norm = QRectF(*rect_tuple)
-            r = self._norm
-            os.environ["OCR_SUBTITLE_RECT"] = f"{r.x():.4f},{r.y():.4f},{r.width():.4f},{r.height():.4f}"
-            os.environ["OCR_CROP_RATIO"] = f"{r.height():.4f}"
-            return
+        else:
+            default_rect1 = get_default_ocr_rect_for_video(target_path, w)
+            self._norm = QRectF(*default_rect1)
 
-        # Nếu không có video cụ thể (khởi động app), đọc từ env nếu có
-        if not target_path:
-            v = os.getenv("OCR_SUBTITLE_RECT", "")
+        v2 = os.getenv("OCR_SUBTITLE_RECT_2", "")
+        if v2:
             try:
-                parts = [float(x) for x in v.split(",")]
-                if len(parts) == 4:
-                    self._norm = QRectF(*parts)
-                    return
+                parts2 = [float(x) for x in v2.split(",")]
+                if len(parts2) == 4:
+                    rect_tuple_2 = tuple(parts2)
             except Exception:
                 pass
+        self._norm2 = QRectF(*(rect_tuple_2 or (0.08, 0.09, 0.84, 0.085)))
 
-        # Mặc định theo tỉ lệ riêng của video này (tuyệt đối không dùng ké vị trí video trước!)
-        default_rect = get_default_ocr_rect_for_video(target_path, w)
-        self._norm = QRectF(*default_rect)
-        r = self._norm
-        r_str = f"{r.x():.4f},{r.y():.4f},{r.width():.4f},{r.height():.4f}"
-        os.environ["OCR_SUBTITLE_RECT"] = r_str
-        os.environ["OCR_CROP_RATIO"] = f"{r.height():.4f}"
-        if target_path and w:
-            norm_p = os.path.normpath(target_path)
-            if not hasattr(w, "_video_ocr_rects"):
-                w._video_ocr_rects = {}
-            w._video_ocr_rects[norm_p] = default_rect
-            ctrl = getattr(w, "_batch_controller", None)
-            if ctrl:
-                for ws in ctrl.workspaces:
-                    if os.path.normpath(ws.video_path) == norm_p:
-                        if not getattr(ws, "ocr_rect", None):
-                            ws.ocr_rect = default_rect
-                            ws.blur_rect = default_rect
-                        break
+        r1 = self._norm
+        r2 = self._norm2
+        os.environ["OCR_SUBTITLE_RECT"] = f"{r1.x():.4f},{r1.y():.4f},{r1.width():.4f},{r1.height():.4f}"
+        os.environ["OCR_SUBTITLE_RECT_2"] = f"{r2.x():.4f},{r2.y():.4f},{r2.width():.4f},{r2.height():.4f}"
+        os.environ["OCR_CROP_RATIO"] = f"{r1.height():.4f}"
 
     def restore_for_video(self, video_path: str):
-        """Khôi phục khung OCR riêng của video được chỉ định."""
+        """Khôi phục khung OCR và chế độ 1/2 khung của video được chỉ định."""
         self._user_customized = False
         self._load_rect(video_path)
+        w = getattr(self, "_main_window", None)
+        target_view = getattr(self, "_target_view", None)
+        if w is None and target_view is not None:
+            w = target_view.window()
+        if w and hasattr(w, "_video_ocr_box_modes") and video_path:
+            norm_p = os.path.normpath(video_path)
+            if norm_p in w._video_ocr_box_modes:
+                mode = w._video_ocr_box_modes[norm_p]
+                self._box_mode = mode
+                os.environ["OCR_BOX_MODE"] = str(mode)
+                combo = getattr(w, "ocr_box_mode_combo", None)
+                if combo is not None:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(1 if mode == 2 else 0)
+                    combo.blockSignals(False)
         self.update()
 
     def _save_rect(self):
         self._user_customized = True
-        r = self._norm
-        r_tuple = (float(r.x()), float(r.y()), float(r.width()), float(r.height()))
-        r_str = f"{r.x():.4f},{r.y():.4f},{r.width():.4f},{r.height():.4f}"
-        os.environ["OCR_SUBTITLE_RECT"] = r_str
-        os.environ["OCR_CROP_RATIO"] = f"{r.height():.4f}"
+        r1 = self._norm
+        r2 = self._norm2
+        r1_tuple = (float(r1.x()), float(r1.y()), float(r1.width()), float(r1.height()))
+        r2_tuple = (float(r2.x()), float(r2.y()), float(r2.width()), float(r2.height()))
+        r1_str = f"{r1.x():.4f},{r1.y():.4f},{r1.width():.4f},{r1.height():.4f}"
+        r2_str = f"{r2.x():.4f},{r2.y():.4f},{r2.width():.4f},{r2.height():.4f}"
+
+        os.environ["OCR_SUBTITLE_RECT"] = r1_str
+        os.environ["OCR_SUBTITLE_RECT_2"] = r2_str
+        os.environ["OCR_CROP_RATIO"] = f"{r1.height():.4f}"
 
         # Lưu lại cho video hiện tại
         w = getattr(self, "_main_window", None)
@@ -268,21 +308,28 @@ class OcrRegionOverlay(QWidget):
                 norm_p = os.path.normpath(cur_video)
                 if not hasattr(w, "_video_ocr_rects"):
                     w._video_ocr_rects = {}
-                w._video_ocr_rects[norm_p] = r_tuple
+                if not hasattr(w, "_video_ocr_rects_2"):
+                    w._video_ocr_rects_2 = {}
+                if not hasattr(w, "_video_ocr_box_modes"):
+                    w._video_ocr_box_modes = {}
+                w._video_ocr_rects[norm_p] = r1_tuple
+                w._video_ocr_rects_2[norm_p] = r2_tuple
+                w._video_ocr_box_modes[norm_p] = getattr(self, "_box_mode", 1)
 
                 # Cập nhật sang Batch Controller
                 ctrl = getattr(w, "_batch_controller", None)
                 if ctrl:
                     for ws in ctrl.workspaces:
                         if os.path.normpath(ws.video_path) == norm_p:
-                            ws.ocr_rect = r_tuple
-                            ws.blur_rect = r_tuple
+                            ws.ocr_rect = r1_tuple
+                            ws.blur_rect = r1_tuple
                             break
 
                 # Cập nhật sang current_project_state và lưu project file
                 ps = getattr(w, "current_project_state", None)
                 if ps and hasattr(ps, "settings"):
-                    ps.settings["ocr_subtitle_rect"] = r_str
+                    ps.settings["ocr_subtitle_rect"] = r1_str
+                    ps.settings["ocr_subtitle_rect_2"] = r2_str
                     project_service = getattr(w, "project_service", None)
                     if project_service and hasattr(project_service, "save_project"):
                         try:
@@ -294,14 +341,14 @@ class OcrRegionOverlay(QWidget):
                 vv = getattr(w, "video_view", None)
                 vid_w = int(getattr(vv, "video_source_width", 0) or getattr(w, "current_video_width", 0) or 0)
                 vid_h = int(getattr(vv, "video_source_height", 0) or getattr(w, "current_video_height", 0) or 0)
-                rx = int(round(r.x() * vid_w)) if vid_w else 0
-                ry = int(round(r.y() * vid_h)) if vid_h else 0
-                rw = int(round(r.width() * vid_w)) if vid_w else 0
-                rh = int(round(r.height() * vid_h)) if vid_h else 0
+                rx = int(round(r1.x() * vid_w)) if vid_w else 0
+                ry = int(round(r1.y() * vid_h)) if vid_h else 0
+                rw = int(round(r1.width() * vid_w)) if vid_w else 0
+                rh = int(round(r1.height() * vid_h)) if vid_h else 0
                 log_msg = (
                     f"[OCR] 💾 Đã lưu vùng quét OCR cho '{os.path.basename(cur_video)}': "
                     f"X={rx}px, Y={ry}px, Rộng={rw}px, Cao={rh}px "
-                    f"(Tỉ lệ {r.width()*100:.1f}%×{r.height()*100:.1f}% trên video {vid_w}×{vid_h})"
+                    f"(Tỉ lệ {r1.width()*100:.1f}%×{r1.height()*100:.1f}% trên video {vid_w}×{vid_h})"
                 )
                 print(log_msg)
                 if hasattr(w, "log"):
@@ -437,6 +484,15 @@ class OcrRegionOverlay(QWidget):
             self._norm.height() * c.height(),
         )
 
+    def _ocr_rect_2(self):
+        c = self._content_rect()
+        return QRectF(
+            c.x() + self._norm2.x() * c.width(),
+            c.y() + self._norm2.y() * c.height(),
+            self._norm2.width() * c.width(),
+            self._norm2.height() * c.height(),
+        )
+
     def _set_ocr_rect(self, rect: QRectF):
         c = self._content_rect()
         w = max(1.0, float(c.width()))
@@ -458,7 +514,29 @@ class OcrRegionOverlay(QWidget):
             min(1.0, bounded.width() / w),
             min(1.0, bounded.height() / h),
         )
-        self._save_rect()
+        self.update()
+
+    def _set_ocr_rect_2(self, rect: QRectF):
+        c = self._content_rect()
+        w = max(1.0, float(c.width()))
+        h = max(1.0, float(c.height()))
+        bounded = QRectF(rect)
+        bounded.setWidth(max(self._MIN_W, bounded.width()))
+        bounded.setHeight(max(self._MIN_H, bounded.height()))
+        if bounded.left() < c.left():
+            bounded.moveLeft(c.left())
+        if bounded.top() < c.top():
+            bounded.moveTop(c.top())
+        if bounded.right() > c.right():
+            bounded.moveRight(c.right())
+        if bounded.bottom() > c.bottom():
+            bounded.moveBottom(c.bottom())
+        self._norm2 = QRectF(
+            max(0.0, (bounded.x() - c.x()) / w),
+            max(0.0, (bounded.y() - c.y()) / h),
+            min(1.0, bounded.width() / w),
+            min(1.0, bounded.height() / h),
+        )
         self.update()
 
     def _handle_rects(self, rect: QRectF):
@@ -469,17 +547,34 @@ class OcrRegionOverlay(QWidget):
             "top_right": rect.topRight(),
             "bottom_left": rect.bottomLeft(),
             "bottom_right": rect.bottomRight(),
+            "top": QtCore.QPointF(rect.center().x(), rect.top()),
+            "bottom": QtCore.QPointF(rect.center().x(), rect.bottom()),
+            "left": QtCore.QPointF(rect.left(), rect.center().y()),
+            "right": QtCore.QPointF(rect.right(), rect.center().y()),
         }
         return {k: QRectF(p.x() - half, p.y() - half, s, s) for k, p in pts.items()}
 
     def _hit_test(self, pos):
-        r = self._ocr_rect()
-        for name, hr in self._handle_rects(r).items():
+        # 1. Kiểm tra các tay cầm của Khung 2 trước (chỉ khi ở chế độ 2 Khung OCR)
+        if getattr(self, "_box_mode", 1) == 2:
+            r2 = self._ocr_rect_2()
+            for name, hr in self._handle_rects(r2).items():
+                if hr.contains(pos):
+                    return ("box2", name)
+        # 2. Kiểm tra các tay cầm của Khung 1
+        r1 = self._ocr_rect()
+        for name, hr in self._handle_rects(r1).items():
             if hr.contains(pos):
-                return name
-        if r.contains(pos):
-            return "move"
-        return ""
+                return ("box1", name)
+        # 3. Kiểm tra click vào trong Khung 2 (chỉ khi ở chế độ 2 Khung OCR)
+        if getattr(self, "_box_mode", 1) == 2:
+            r2 = self._ocr_rect_2()
+            if r2.contains(pos):
+                return ("box2", "move")
+        # 4. Kiểm tra click vào trong Khung 1
+        if r1.contains(pos):
+            return ("box1", "move")
+        return ("", "")
 
     def mousePressEvent(self, event):
         if not self._editable or event.button() != Qt.LeftButton:
@@ -491,8 +586,13 @@ class OcrRegionOverlay(QWidget):
             event.ignore()
             return
         pos = event.position()
-        self._drag_mode = self._hit_test(pos)
-        self._rect_on_press = QRectF(self._ocr_rect())
+        target_box, mode = self._hit_test(pos)
+        self._drag_target_box = target_box
+        self._drag_mode = mode
+        if target_box == "box2":
+            self._rect_on_press = QRectF(self._ocr_rect_2())
+        else:
+            self._rect_on_press = QRectF(self._ocr_rect())
         self._press_pos = pos
         if self._drag_mode == "move":
             self._drag_offset = pos - self._rect_on_press.topLeft()
@@ -507,9 +607,17 @@ class OcrRegionOverlay(QWidget):
             event.ignore()
             return
         if not self._drag_mode:
-            hit = self._hit_test(pos)
+            target_box, hit = self._hit_test(pos)
             if hit == "move":
                 self.setCursor(Qt.OpenHandCursor)
+            elif hit in ("top_left", "bottom_right"):
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif hit in ("top_right", "bottom_left"):
+                self.setCursor(Qt.SizeBDiagCursor)
+            elif hit in ("top", "bottom"):
+                self.setCursor(Qt.SizeVerCursor)
+            elif hit in ("left", "right"):
+                self.setCursor(Qt.SizeHorCursor)
             elif hit:
                 self.setCursor(Qt.SizeAllCursor)
             else:
@@ -539,7 +647,10 @@ class OcrRegionOverlay(QWidget):
                     rect.setTop(rect.bottom() - self._MIN_H)
                 else:
                     rect.setBottom(rect.top() + self._MIN_H)
-        self._set_ocr_rect(rect)
+        if self._drag_target_box == "box2":
+            self._set_ocr_rect_2(rect)
+        else:
+            self._set_ocr_rect(rect)
         event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -555,34 +666,17 @@ class OcrRegionOverlay(QWidget):
     def paintEvent(self, event):
         if self._target_view is None:
             return
-        rect = self._ocr_rect()
-        if rect.isEmpty():
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setCompositionMode(QPainter.CompositionMode_Source)
         p.fillRect(self.rect(), QColor(0, 0, 0, 0))
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
-        color = QColor(110, 231, 214) if not self._editable else QColor(255, 180, 80)
-        a = 120 if not self._editable else 180
-        p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), a), 2))
-        p.setBrush(QColor(color.red(), color.green(), color.blue(), a // 4))
-        p.drawRoundedRect(rect, 8, 8)
-
-        if self._editable:
-            p.setBrush(QColor(255, 180, 80, 235))
-            p.setPen(QPen(QColor(12, 24, 38, 220), 1))
-            for hr in self._handle_rects(rect).values():
-                p.drawEllipse(hr)
-
-        p.setPen(QColor(color.red(), color.green(), color.blue(), 200))
         font = p.font()
         font.setPixelSize(11)
         font.setBold(True)
         p.setFont(font)
 
-        # Tính toán kích thước pixel thực tế trên video
         vid_w = 0
         vid_h = 0
         w = getattr(self, "_main_window", None)
@@ -595,29 +689,85 @@ class OcrRegionOverlay(QWidget):
             vid_w = int(getattr(self._target_view, "video_source_width", 0) or 0)
             vid_h = int(getattr(self._target_view, "video_source_height", 0) or 0)
 
-        real_w = int(round(self._norm.width() * vid_w)) if vid_w else int(rect.width())
-        real_h = int(round(self._norm.height() * vid_h)) if vid_h else int(rect.height())
+        # -------------------------------------------------------------
+        # 1. VẼ KHUNG OCR 1 (MÀU VÀNG CAM - MẶC ĐỊNH Ở ĐÁY)
+        # -------------------------------------------------------------
+        r1 = self._ocr_rect()
+        if not r1.isEmpty():
+            c1 = QColor(245, 158, 11)  # Vàng hổ phách / Cam
+            a1 = 180 if self._editable else 120
+            p.setPen(QPen(QColor(c1.red(), c1.green(), c1.blue(), a1), 2))
+            p.setBrush(QColor(c1.red(), c1.green(), c1.blue(), a1 // 4))
+            p.drawRoundedRect(r1, 8, 8)
 
-        badge_text = f" OCR: {real_w}×{real_h} px ({self._norm.height()*100:.0f}%) "
-        if vid_w and vid_h:
-            badge_text += f"| Video: {vid_w}×{vid_h} "
+            if self._editable:
+                p.setBrush(QColor(c1.red(), c1.green(), c1.blue(), 235))
+                p.setPen(QPen(QColor(12, 24, 38, 220), 1))
+                for hr in self._handle_rects(r1).values():
+                    p.drawEllipse(hr)
 
-        # Vẽ badge nền tối giúp nhìn rõ trên mọi nền video
-        fm = p.fontMetrics()
-        tw = fm.horizontalAdvance(badge_text) + 8
-        th = fm.height() + 4
-        bx = int(rect.left() + 6)
-        by = int(rect.top() - th - 4)
-        if by < 2:
-            by = int(rect.bottom() + 4)
-        badge_rect = QRectF(bx, by, tw, th)
+            w1_px = int(round(self._norm.width() * vid_w)) if vid_w else int(r1.width())
+            h1_px = int(round(self._norm.height() * vid_h)) if vid_h else int(r1.height())
+            is_dual = (getattr(self, "_box_mode", 1) == 2)
+            prefix1 = " 📍 OCR 1 (Đáy):" if is_dual else " 📍 OCR:"
+            text1 = f"{prefix1} {w1_px}×{h1_px} px ({self._norm.height()*100:.0f}%) "
+            if vid_w and vid_h:
+                text1 += f"| Video: {vid_w}×{vid_h} "
 
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(15, 23, 42, 220))
-        p.drawRoundedRect(badge_rect, 4, 4)
+            fm = p.fontMetrics()
+            tw1 = fm.horizontalAdvance(text1) + 8
+            th1 = fm.height() + 4
+            bx1 = int(r1.left() + 6)
+            by1 = int(r1.top() - th1 - 4)
+            if by1 < 2:
+                by1 = int(r1.bottom() + 4)
+            b_rect1 = QRectF(bx1, by1, tw1, th1)
 
-        p.setPen(QColor(255, 180, 80) if self._editable else QColor(110, 231, 214))
-        p.drawText(badge_rect, Qt.AlignCenter, badge_text)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(15, 23, 42, 220))
+            p.drawRoundedRect(b_rect1, 4, 4)
+            p.setPen(c1)
+            p.drawText(b_rect1, Qt.AlignCenter, text1)
+
+        # -------------------------------------------------------------
+        # 2. VẼ KHUNG OCR 2 (MÀU XANH CYAN - MẶC ĐỊNH Ở ĐỈNH) - CHỈ KHI Ở CHẾ ĐỘ 2 KHUNG
+        # -------------------------------------------------------------
+        if getattr(self, "_box_mode", 1) == 2:
+            r2 = self._ocr_rect_2()
+            if not r2.isEmpty():
+                c2 = QColor(56, 189, 248)  # Xanh Cyan / Sky Blue
+                a2 = 180 if self._editable else 120
+                p.setPen(QPen(QColor(c2.red(), c2.green(), c2.blue(), a2), 2))
+                p.setBrush(QColor(c2.red(), c2.green(), c2.blue(), a2 // 4))
+                p.drawRoundedRect(r2, 8, 8)
+
+                if self._editable:
+                    p.setBrush(QColor(c2.red(), c2.green(), c2.blue(), 235))
+                    p.setPen(QPen(QColor(12, 24, 38, 220), 1))
+                    for hr in self._handle_rects(r2).values():
+                        p.drawEllipse(hr)
+
+                w2_px = int(round(self._norm2.width() * vid_w)) if vid_w else int(r2.width())
+                h2_px = int(round(self._norm2.height() * vid_h)) if vid_h else int(r2.height())
+                text2 = f" 📍 OCR 2 (Đỉnh): {w2_px}×{h2_px} px ({self._norm2.height()*100:.0f}%) "
+                if vid_w and vid_h:
+                    text2 += f"| Video: {vid_w}×{vid_h} "
+
+                fm = p.fontMetrics()
+                tw2 = fm.horizontalAdvance(text2) + 8
+                th2 = fm.height() + 4
+                bx2 = int(r2.left() + 6)
+                by2 = int(r2.top() - th2 - 4)
+                if by2 < 2:
+                    by2 = int(r2.bottom() + 4)
+                b_rect2 = QRectF(bx2, by2, tw2, th2)
+
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(15, 23, 42, 220))
+                p.drawRoundedRect(b_rect2, 4, 4)
+                p.setPen(c2)
+                p.drawText(b_rect2, Qt.AlignCenter, text2)
+
         p.end()
 
 
@@ -1134,6 +1284,522 @@ class WatermarkRegionOverlay(QWidget):
         p.end()
 
 
+class LogoPlacementOverlay(QWidget):
+    """Khung kéo chọn vị trí và kích thước gắn Logo thương hiệu trên màn hình Video."""
+    rectChanged = Signal(tuple)
+    _HANDLE_SIZE = 12
+    _MIN_W = 24
+    _MIN_H = 16
+
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool)
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowFlag(Qt.WindowDoesNotAcceptFocus, True)
+        self.setStyleSheet("background: transparent;")
+        self._target_view = None
+        self._main_window = None
+        self._requested_visible = False
+        self._editable = True
+        self._drag_mode = ""
+        self._drag_offset = QRectF()
+        self._rect_on_press = QRectF()
+        self._press_pos = QtCore.QPointF()
+        # Vị trí mặc định ở góc trên bên phải (khung hình hoạt hình hoặc video)
+        self._norm = QRectF(0.68, 0.08, 0.22, 0.12)
+        self._user_customized = False
+        self.hide()
+
+    def get_norm_rect(self) -> tuple:
+        return (float(self._norm.x()), float(self._norm.y()), float(self._norm.width()), float(self._norm.height()))
+
+    def set_norm_rect(self, x: float, y: float, w: float, h: float):
+        self._norm = QRectF(x, y, w, h)
+        self._user_customized = True
+        self.update()
+
+    def attach_to_view(self, view, main_window=None):
+        self._target_view = view
+        if main_window is not None:
+            self._main_window = main_window
+        elif self._main_window is None and view:
+            w = view.window()
+            if w is not None:
+                self._main_window = w
+        if self._main_window is not None:
+            try:
+                self._main_window.installEventFilter(self)
+                self._main_window.destroyed.connect(self.close)
+            except Exception:
+                pass
+        if self._target_view is not None:
+            try:
+                self._target_view.installEventFilter(self)
+            except Exception:
+                pass
+
+    def set_editable(self, editable: bool):
+        self._editable = editable
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, not self._editable)
+        self.setCursor(Qt.OpenHandCursor if editable else Qt.ArrowCursor)
+        self.update()
+
+    def eventFilter(self, obj, event):
+        if obj is self._main_window or obj is self._target_view:
+            if obj is self._main_window and event.type() in (QtCore.QEvent.WindowDeactivate, QtCore.QEvent.Close, QtCore.QEvent.Hide):
+                self.hide()
+                if event.type() == QtCore.QEvent.Close:
+                    self.close()
+            elif event.type() in (QtCore.QEvent.WindowActivate, QtCore.QEvent.Resize, QtCore.QEvent.Move, QtCore.QEvent.Show):
+                if bool(getattr(self, "_requested_visible", False)):
+                    self.sync_to_view()
+                else:
+                    self.hide()
+        return False
+
+    def sync_to_view(self):
+        if not self._target_view:
+            self.hide()
+            return
+        if not bool(getattr(self, "_requested_visible", False)):
+            self.hide()
+            return
+        top_left = self._target_view.mapToGlobal(QtCore.QPoint(0, 0))
+        self.setGeometry(QtCore.QRect(top_left, self._target_view.size()))
+        self.show()
+        self.raise_()
+        self.update()
+
+    def _content_rect(self):
+        if self._target_view and hasattr(self._target_view, "get_video_content_rect"):
+            r = self._target_view.get_video_content_rect()
+            if r.width() > 0 and r.height() > 0:
+                return r
+        return QRectF(0, 0, float(self.width()), float(self.height()))
+
+    def _logo_rect(self):
+        c = self._content_rect()
+        return QRectF(
+            c.x() + self._norm.x() * c.width(),
+            c.y() + self._norm.y() * c.height(),
+            self._norm.width() * c.width(),
+            self._norm.height() * c.height(),
+        )
+
+    def _set_logo_rect(self, rect: QRectF):
+        c = self._content_rect()
+        w = max(1.0, float(c.width()))
+        h = max(1.0, float(c.height()))
+        bounded = QRectF(rect)
+        bounded.setWidth(max(self._MIN_W, bounded.width()))
+        bounded.setHeight(max(self._MIN_H, bounded.height()))
+        if bounded.left() < c.left():
+            bounded.moveLeft(c.left())
+        if bounded.top() < c.top():
+            bounded.moveTop(c.top())
+        if bounded.right() > c.right():
+            bounded.moveRight(c.right())
+        if bounded.bottom() > c.bottom():
+            bounded.moveBottom(c.bottom())
+        self._norm = QRectF(
+            max(0.0, (bounded.x() - c.x()) / w),
+            max(0.0, (bounded.y() - c.y()) / h),
+            min(1.0, bounded.width() / w),
+            min(1.0, bounded.height() / h),
+        )
+        self._user_customized = True
+        self.rectChanged.emit(self.get_norm_rect())
+        self.update()
+
+    def _handle_rects(self, rect: QRectF):
+        s = float(self._HANDLE_SIZE)
+        half = s / 2.0
+        pts = {
+            "top_left": rect.topLeft(),
+            "top_right": rect.topRight(),
+            "bottom_left": rect.bottomLeft(),
+            "bottom_right": rect.bottomRight(),
+            "top": QtCore.QPointF(rect.center().x(), rect.top()),
+            "bottom": QtCore.QPointF(rect.center().x(), rect.bottom()),
+            "left": QtCore.QPointF(rect.left(), rect.center().y()),
+            "right": QtCore.QPointF(rect.right(), rect.center().y()),
+        }
+        return {k: QRectF(p.x() - half, p.y() - half, s, s) for k, p in pts.items()}
+
+    def _hit_test(self, pos):
+        r = self._logo_rect()
+        for name, hr in self._handle_rects(r).items():
+            if hr.contains(pos):
+                return name
+        if r.contains(pos):
+            return "move"
+        return ""
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        pos = event.position()
+        self._drag_mode = self._hit_test(pos)
+        if not self._drag_mode:
+            event.ignore()
+            return
+        r = self._logo_rect()
+        self._rect_on_press = QRectF(r)
+        self._press_pos = pos
+        self._drag_offset = pos - r.topLeft()
+        self.setCursor(Qt.ClosedHandCursor if self._drag_mode == "move" else Qt.SizeAllCursor)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not self._drag_mode or not (event.buttons() & Qt.LeftButton):
+            pos = event.position()
+            hit = self._hit_test(pos)
+            if hit == "move":
+                self.setCursor(Qt.OpenHandCursor)
+            elif hit in ("top_left", "bottom_right"):
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif hit in ("top_right", "bottom_left"):
+                self.setCursor(Qt.SizeBDiagCursor)
+            elif hit in ("top", "bottom"):
+                self.setCursor(Qt.SizeVerCursor)
+            elif hit in ("left", "right"):
+                self.setCursor(Qt.SizeHorCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+            return
+        pos = event.position()
+        rect = QRectF(self._rect_on_press)
+        if self._drag_mode == "move":
+            rect.moveTopLeft(pos - self._drag_offset)
+        else:
+            d = pos - self._press_pos
+            if "left" in self._drag_mode:
+                rect.setLeft(rect.left() + d.x())
+            if "right" in self._drag_mode:
+                rect.setRight(rect.right() + d.x())
+            if "top" in self._drag_mode:
+                rect.setTop(rect.top() + d.y())
+            if "bottom" in self._drag_mode:
+                rect.setBottom(rect.bottom() + d.y())
+            if rect.width() < self._MIN_W:
+                if "left" in self._drag_mode:
+                    rect.setLeft(rect.right() - self._MIN_W)
+                else:
+                    rect.setRight(rect.left() + self._MIN_W)
+            if rect.height() < self._MIN_H:
+                if "top" in self._drag_mode:
+                    rect.setTop(rect.bottom() - self._MIN_H)
+                else:
+                    rect.setBottom(rect.top() + self._MIN_H)
+        self._set_logo_rect(rect)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_mode = ""
+        self.setCursor(Qt.OpenHandCursor if self._editable else Qt.ArrowCursor)
+        self.update()
+        event.accept()
+
+    def paintEvent(self, event):
+        if self._target_view is None:
+            return
+        rect = self._logo_rect()
+        if rect.isEmpty():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        # Viền màu vàng hổ phách tươi sáng sang trọng
+        border_col = QColor(245, 158, 11, 235)
+        fill_col = QColor(245, 158, 11, 40)
+
+        p.setPen(QPen(border_col, 2, Qt.SolidLine))
+        p.setBrush(fill_col)
+        p.drawRoundedRect(rect, 6, 6)
+
+        # Vẽ các núm co giãn (handles)
+        p.setBrush(QColor(251, 191, 36, 245))
+        p.setPen(QPen(QColor(20, 15, 5, 230), 1))
+        for hr in self._handle_rects(rect).values():
+            p.drawEllipse(hr)
+
+        # Nhãn nhận diện
+        p.setPen(QColor(254, 243, 199, 245))
+        font = p.font()
+        font.setPixelSize(11)
+        font.setBold(True)
+        p.setFont(font)
+        p.drawText(int(rect.left() + 6), int(rect.top() - 6 if rect.top() > 18 else rect.bottom() + 14), "🏷️ Vị trí Đặt Logo của bạn")
+        p.end()
+
+
+class WatermarkPlacementOverlay(QWidget):
+    """Khung kéo chọn vị trí gắn chữ Watermark bản quyền trên màn hình Video."""
+    rectChanged = Signal(tuple)
+    _HANDLE_SIZE = 12
+    _MIN_W = 24
+    _MIN_H = 16
+
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool)
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowFlag(Qt.WindowDoesNotAcceptFocus, True)
+        self.setStyleSheet("background: transparent;")
+        self._target_view = None
+        self._main_window = None
+        self._requested_visible = False
+        self._editable = True
+        self._drag_mode = ""
+        self._drag_offset = QRectF()
+        self._rect_on_press = QRectF()
+        self._press_pos = QtCore.QPointF()
+        # Vị trí mặc định ở góc dưới bên phải (khung hình hoạt hình hoặc video)
+        self._norm = QRectF(0.55, 0.82, 0.38, 0.06)
+        self._user_customized = False
+        self.hide()
+
+    def get_norm_rect(self) -> tuple:
+        return (float(self._norm.x()), float(self._norm.y()), float(self._norm.width()), float(self._norm.height()))
+
+    def set_norm_rect(self, x: float, y: float, w: float, h: float):
+        self._norm = QRectF(x, y, w, h)
+        self._user_customized = True
+        self.update()
+
+    def attach_to_view(self, view, main_window=None):
+        self._target_view = view
+        if main_window is not None:
+            self._main_window = main_window
+        elif self._main_window is None and view:
+            w = view.window()
+            if w is not None:
+                self._main_window = w
+        if self._main_window is not None:
+            try:
+                self._main_window.installEventFilter(self)
+                self._main_window.destroyed.connect(self.close)
+            except Exception:
+                pass
+        if self._target_view is not None:
+            try:
+                self._target_view.installEventFilter(self)
+            except Exception:
+                pass
+
+    def set_editable(self, editable: bool):
+        self._editable = editable
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, not self._editable)
+        self.setCursor(Qt.OpenHandCursor if editable else Qt.ArrowCursor)
+        self.update()
+
+    def eventFilter(self, obj, event):
+        if obj is self._main_window or obj is self._target_view:
+            if obj is self._main_window and event.type() in (QtCore.QEvent.WindowDeactivate, QtCore.QEvent.Close, QtCore.QEvent.Hide):
+                self.hide()
+                if event.type() == QtCore.QEvent.Close:
+                    self.close()
+            elif event.type() in (QtCore.QEvent.WindowActivate, QtCore.QEvent.Resize, QtCore.QEvent.Move, QtCore.QEvent.Show):
+                if bool(getattr(self, "_requested_visible", False)):
+                    self.sync_to_view()
+                else:
+                    self.hide()
+        return False
+
+    def sync_to_view(self):
+        if not self._target_view:
+            self.hide()
+            return
+        if not bool(getattr(self, "_requested_visible", False)):
+            self.hide()
+            return
+        top_left = self._target_view.mapToGlobal(QtCore.QPoint(0, 0))
+        self.setGeometry(QtCore.QRect(top_left, self._target_view.size()))
+        self.show()
+        self.raise_()
+        self.update()
+
+    def _content_rect(self):
+        if self._target_view and hasattr(self._target_view, "get_video_content_rect"):
+            r = self._target_view.get_video_content_rect()
+            if r.width() > 0 and r.height() > 0:
+                return r
+        return QRectF(0, 0, float(self.width()), float(self.height()))
+
+    def _wm_rect(self):
+        c = self._content_rect()
+        return QRectF(
+            c.x() + self._norm.x() * c.width(),
+            c.y() + self._norm.y() * c.height(),
+            self._norm.width() * c.width(),
+            self._norm.height() * c.height(),
+        )
+
+    def _set_wm_rect(self, rect: QRectF):
+        c = self._content_rect()
+        w = max(1.0, float(c.width()))
+        h = max(1.0, float(c.height()))
+        bounded = QRectF(rect)
+        bounded.setWidth(max(self._MIN_W, bounded.width()))
+        bounded.setHeight(max(self._MIN_H, bounded.height()))
+        if bounded.left() < c.left():
+            bounded.moveLeft(c.left())
+        if bounded.top() < c.top():
+            bounded.moveTop(c.top())
+        if bounded.right() > c.right():
+            bounded.moveRight(c.right())
+        if bounded.bottom() > c.bottom():
+            bounded.moveBottom(c.bottom())
+        self._norm = QRectF(
+            max(0.0, (bounded.x() - c.x()) / w),
+            max(0.0, (bounded.y() - c.y()) / h),
+            min(1.0, bounded.width() / w),
+            min(1.0, bounded.height() / h),
+        )
+        self._user_customized = True
+        self.rectChanged.emit(self.get_norm_rect())
+        self.update()
+
+    def _handle_rects(self, rect: QRectF):
+        s = float(self._HANDLE_SIZE)
+        half = s / 2.0
+        pts = {
+            "top_left": rect.topLeft(),
+            "top_right": rect.topRight(),
+            "bottom_left": rect.bottomLeft(),
+            "bottom_right": rect.bottomRight(),
+            "top": QtCore.QPointF(rect.center().x(), rect.top()),
+            "bottom": QtCore.QPointF(rect.center().x(), rect.bottom()),
+            "left": QtCore.QPointF(rect.left(), rect.center().y()),
+            "right": QtCore.QPointF(rect.right(), rect.center().y()),
+        }
+        return {k: QRectF(p.x() - half, p.y() - half, s, s) for k, p in pts.items()}
+
+    def _hit_test(self, pos):
+        r = self._wm_rect()
+        for name, hr in self._handle_rects(r).items():
+            if hr.contains(pos):
+                return name
+        if r.contains(pos):
+            return "move"
+        return ""
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        pos = event.position()
+        self._drag_mode = self._hit_test(pos)
+        if not self._drag_mode:
+            event.ignore()
+            return
+        r = self._wm_rect()
+        self._rect_on_press = QRectF(r)
+        self._press_pos = pos
+        self._drag_offset = pos - r.topLeft()
+        self.setCursor(Qt.ClosedHandCursor if self._drag_mode == "move" else Qt.SizeAllCursor)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not self._drag_mode or not (event.buttons() & Qt.LeftButton):
+            pos = event.position()
+            hit = self._hit_test(pos)
+            if hit == "move":
+                self.setCursor(Qt.OpenHandCursor)
+            elif hit in ("top_left", "bottom_right"):
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif hit in ("top_right", "bottom_left"):
+                self.setCursor(Qt.SizeBDiagCursor)
+            elif hit in ("top", "bottom"):
+                self.setCursor(Qt.SizeVerCursor)
+            elif hit in ("left", "right"):
+                self.setCursor(Qt.SizeHorCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+            return
+        pos = event.position()
+        rect = QRectF(self._rect_on_press)
+        if self._drag_mode == "move":
+            rect.moveTopLeft(pos - self._drag_offset)
+        else:
+            d = pos - self._press_pos
+            if "left" in self._drag_mode:
+                rect.setLeft(rect.left() + d.x())
+            if "right" in self._drag_mode:
+                rect.setRight(rect.right() + d.x())
+            if "top" in self._drag_mode:
+                rect.setTop(rect.top() + d.y())
+            if "bottom" in self._drag_mode:
+                rect.setBottom(rect.bottom() + d.y())
+            if rect.width() < self._MIN_W:
+                if "left" in self._drag_mode:
+                    rect.setLeft(rect.right() - self._MIN_W)
+                else:
+                    rect.setRight(rect.left() + self._MIN_W)
+            if rect.height() < self._MIN_H:
+                if "top" in self._drag_mode:
+                    rect.setTop(rect.bottom() - self._MIN_H)
+                else:
+                    rect.setBottom(rect.top() + self._MIN_H)
+        self._set_wm_rect(rect)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_mode = ""
+        self.setCursor(Qt.OpenHandCursor if self._editable else Qt.ArrowCursor)
+        self.update()
+        event.accept()
+
+    def paintEvent(self, event):
+        if self._target_view is None:
+            return
+        rect = self._wm_rect()
+        if rect.isEmpty():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        # Viền màu tím neon nổi bật, tách biệt với tất cả các khung khác
+        border_col = QColor(168, 85, 247, 235)
+        fill_col = QColor(168, 85, 247, 40)
+
+        p.setPen(QPen(border_col, 2, Qt.SolidLine))
+        p.setBrush(fill_col)
+        p.drawRoundedRect(rect, 6, 6)
+
+        # Vẽ các núm co giãn (handles)
+        p.setBrush(QColor(192, 132, 252, 245))
+        p.setPen(QPen(QColor(25, 10, 35, 230), 1))
+        for hr in self._handle_rects(rect).values():
+            p.drawEllipse(hr)
+
+        # Nhãn nhận diện
+        p.setPen(QColor(243, 232, 255, 245))
+        font = p.font()
+        font.setPixelSize(11)
+        font.setBold(True)
+        p.setFont(font)
+        p.drawText(int(rect.left() + 6), int(rect.top() - 6 if rect.top() > 18 else rect.bottom() + 14), "✍️ Vị trí Đặt Watermark của bạn")
+        p.end()
+
+
 class OcrTranslatorOverlay(QWidget):
     """Persistent, on-demand visual-text OCR selection over the preview."""
     captureRequested = Signal()
@@ -1630,6 +2296,46 @@ def build_preview_panel(gui, left_panel=None):
     gui.ocr_region_btn.setFixedSize(38, 38)
     gui.ocr_region_btn.setStyleSheet("QPushButton { color: #4ecdc4; font-weight: 700; font-size: 10px; padding: 0; border: none; }")
     gui.ocr_region_btn.show()
+
+    gui.ocr_box_mode_combo = QComboBox()
+    gui.ocr_box_mode_combo.addItem("1 Khung OCR", 1)
+    gui.ocr_box_mode_combo.addItem("2 Khung OCR", 2)
+    from PySide6.QtCore import QSettings
+    saved_box_mode = QSettings("TankVideo", "TankVideoStudio").value("ocr_box_mode", 1, type=int)
+    if saved_box_mode not in (1, 2):
+        saved_box_mode = 1
+    gui.ocr_box_mode_combo.setCurrentIndex(1 if saved_box_mode == 2 else 0)
+    gui.ocr_box_mode_combo.setToolTip("Chọn số lượng khung quét OCR: 1 Khung (chỉ đáy) hoặc 2 Khung (đáy và đỉnh)")
+    gui.ocr_box_mode_combo.setFixedHeight(28)
+    gui.ocr_box_mode_combo.setStyleSheet("""
+        QComboBox {
+            background-color: #1e293b;
+            color: #38bdf8;
+            font-weight: 700;
+            font-size: 11px;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            padding: 1px 6px;
+            min-width: 95px;
+        }
+        QComboBox:hover {
+            border-color: #38bdf8;
+            background-color: #0f172a;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 14px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #0f172a;
+            color: #f1f5f9;
+            selection-background-color: #1e293b;
+            selection-color: #38bdf8;
+            border: 1px solid #334155;
+            padding: 4px;
+        }
+    """)
+    gui.ocr_box_mode_combo.show()
     gui.ocr_translator_btn.setFixedSize(92, 38)
     gui.ocr_translator_btn.setToolTip("Chụp và dịch văn bản trực tiếp từ khung hình video hiện tại")
     gui.ocr_translator_btn.setStyleSheet(
@@ -1696,6 +2402,7 @@ def build_preview_panel(gui, left_panel=None):
     gui.add_text_btn.hide()
     blur_group.addWidget(gui.blur_add_btn)
     blur_group.addWidget(gui.ocr_region_btn)
+    blur_group.addWidget(gui.ocr_box_mode_combo)
 
     gui.delogo_region_btn = QPushButton("Xóa Logo")
     gui.delogo_region_btn.setCheckable(True)
@@ -1718,6 +2425,28 @@ def build_preview_panel(gui, left_panel=None):
     )
     gui.watermark_region_btn.show()
     blur_group.addWidget(gui.watermark_region_btn)
+
+    gui.logo_placement_btn = QPushButton("Đặt Logo")
+    gui.logo_placement_btn.setCheckable(True)
+    gui.logo_placement_btn.setFixedSize(68, 38)
+    gui.logo_placement_btn.setToolTip("Bật / tắt khung kéo chọn vị trí gắn Logo thương hiệu của bạn trên video")
+    gui.logo_placement_btn.setStyleSheet(
+        "QPushButton { color: #f59e0b; font-weight: 700; font-size: 11px; padding: 0 4px; border: none; }"
+        "QPushButton:checked { background: #2e1d08; border: 1px solid #f59e0b; border-radius: 4px; color: #f59e0b; }"
+    )
+    gui.logo_placement_btn.show()
+    blur_group.addWidget(gui.logo_placement_btn)
+
+    gui.watermark_placement_btn = QPushButton("Đặt Watermark")
+    gui.watermark_placement_btn.setCheckable(True)
+    gui.watermark_placement_btn.setFixedSize(96, 38)
+    gui.watermark_placement_btn.setToolTip("Bật / tắt khung kéo chọn vị trí gắn chữ Watermark bản quyền của bạn trên video")
+    gui.watermark_placement_btn.setStyleSheet(
+        "QPushButton { color: #c084fc; font-weight: 700; font-size: 11px; padding: 0 4px; border: none; }"
+        "QPushButton:checked { background: #26113b; border: 1px solid #a855f7; border-radius: 4px; color: #c084fc; }"
+    )
+    gui.watermark_placement_btn.show()
+    blur_group.addWidget(gui.watermark_placement_btn)
 
     gui.ocr_save_btn = QPushButton("💾 Lưu")
     gui.ocr_save_btn.setToolTip("Lưu và ghi nhớ khung OCR hiện tại cho riêng video này")
@@ -1759,8 +2488,38 @@ def build_preview_panel(gui, left_panel=None):
     gui.watermark_region_overlay = WatermarkRegionOverlay()
     gui.watermark_region_overlay._main_window = gui
     gui.watermark_region_overlay.attach_to_view(gui.video_view, main_window=gui)
+    gui.logo_placement_overlay = LogoPlacementOverlay()
+    gui.logo_placement_overlay._main_window = gui
+    gui.logo_placement_overlay.attach_to_view(gui.video_view, main_window=gui)
+    gui.watermark_placement_overlay = WatermarkPlacementOverlay()
+    gui.watermark_placement_overlay._main_window = gui
+    gui.watermark_placement_overlay.attach_to_view(gui.video_view, main_window=gui)
     gui.ocr_translator_overlay = OcrTranslatorOverlay()
     gui.ocr_translator_overlay.attach_to_view(gui.video_view)
+
+    def _on_ocr_box_mode_changed(idx):
+        mode = gui.ocr_box_mode_combo.itemData(idx)
+        if mode not in (1, 2):
+            mode = 1
+        overlay = getattr(gui, "ocr_region_overlay", None)
+        if overlay is not None:
+            overlay.set_box_mode(mode)
+        cur_p = getattr(gui, "_current_video_path", "")
+        if cur_p:
+            norm_p = os.path.normpath(cur_p)
+            if not hasattr(gui, "_video_ocr_box_modes"):
+                gui._video_ocr_box_modes = {}
+            gui._video_ocr_box_modes[norm_p] = mode
+        os.environ["OCR_BOX_MODE"] = str(mode)
+        from PySide6.QtCore import QSettings
+        QSettings("TankVideo", "TankVideoStudio").setValue("ocr_box_mode", mode)
+        mode_text = "1 Khung OCR (Đáy)" if mode == 1 else "2 Khung OCR (Đáy & Đỉnh)"
+        if hasattr(gui, "log"):
+            gui.log(f"[OCR] Đã chuyển chế độ: {mode_text}")
+        if hasattr(gui, "_refresh_media_pool_ui") and callable(gui._refresh_media_pool_ui):
+            gui._refresh_media_pool_ui()
+
+    gui.ocr_box_mode_combo.currentIndexChanged.connect(_on_ocr_box_mode_changed)
 
     def _save_current_video_ocr():
         cur_p = getattr(gui, "_current_video_path", "")
@@ -1773,6 +2532,129 @@ def build_preview_panel(gui, left_panel=None):
             gui._video_ocr_rects = {}
         gui._video_ocr_rects[norm_p] = rect
 
+        cur_mode = 1
+        if hasattr(gui, "ocr_box_mode_combo") and gui.ocr_box_mode_combo:
+            cur_mode = gui.ocr_box_mode_combo.currentData() or 1
+        elif hasattr(overlay, "get_box_mode"):
+            cur_mode = overlay.get_box_mode()
+        if not hasattr(gui, "_video_ocr_box_modes"):
+            gui._video_ocr_box_modes = {}
+        gui._video_ocr_box_modes[norm_p] = cur_mode
+
+        selected_paths = list(getattr(gui, "_selected_media_paths", set()))
+        # Đồng bộ khung OCR cho tất cả các video đang được chọn trong hàng đợi
+        for sel_p in selected_paths:
+            if sel_p:
+                gui._video_ocr_rects[os.path.normpath(sel_p)] = rect
+                gui._video_ocr_box_modes[os.path.normpath(sel_p)] = cur_mode
+
+        # Lưu vào môi trường và QSettings toàn cục để không bị fallback về 65% cũ
+        r_str = f"{rect[0]:.4f},{rect[1]:.4f},{rect[2]:.4f},{rect[3]:.4f}"
+        os.environ["OCR_SUBTITLE_RECT"] = r_str
+        from PySide6.QtCore import QSettings
+        QSettings("TankVideo", "TankVideoStudio").setValue("default_ocr_rect", r_str)
+
+        if hasattr(overlay, "get_norm_rect_2"):
+            rect2 = overlay.get_norm_rect_2()
+            if not hasattr(gui, "_video_ocr_rects_2"):
+                gui._video_ocr_rects_2 = {}
+            gui._video_ocr_rects_2[norm_p] = rect2
+            for sel_p in selected_paths:
+                if sel_p:
+                    gui._video_ocr_rects_2[os.path.normpath(sel_p)] = rect2
+            r2_str = f"{rect2[0]:.4f},{rect2[1]:.4f},{rect2[2]:.4f},{rect2[3]:.4f}"
+            os.environ["OCR_SUBTITLE_RECT_2"] = r2_str
+            QSettings("TankVideo", "TankVideoStudio").setValue("default_ocr_rect_2", r2_str)
+
+        # 2. Ghi nhớ khung Xóa Logo nếu đang bật hoặc người dùng đã tùy biến
+        delogo_saved = False
+        delogo_ov = getattr(gui, "delogo_region_overlay", None)
+        delogo_btn = getattr(gui, "delogo_region_btn", None)
+        delogo_is_active = bool(
+            (delogo_btn and delogo_btn.isChecked())
+            or (delogo_ov and (getattr(delogo_ov, "_requested_visible", False) or getattr(delogo_ov, "_user_customized", False)))
+        )
+        if delogo_is_active and delogo_ov and hasattr(delogo_ov, "get_norm_rect"):
+            dl_rect = delogo_ov.get_norm_rect()
+            if dl_rect and len(dl_rect) == 4 and dl_rect[2] > 0.01 and dl_rect[3] > 0.01:
+                if not hasattr(gui, "_video_delogo_rects"):
+                    gui._video_delogo_rects = {}
+                gui._video_delogo_rects[norm_p] = dl_rect
+                for sel_p in selected_paths:
+                    if sel_p:
+                        gui._video_delogo_rects[os.path.normpath(sel_p)] = dl_rect
+                QSettings("TankVideo", "TankVideoStudio").setValue(
+                    "delogo/default_rect", f"{dl_rect[0]:.4f},{dl_rect[1]:.4f},{dl_rect[2]:.4f},{dl_rect[3]:.4f}"
+                )
+                delogo_saved = True
+
+        # 3. Ghi nhớ khung Xóa Watermark CHỈ KHI nút Xóa Watermark đang được bật hoặc người dùng đã tùy biến
+        wm_saved = False
+        wm_ov = getattr(gui, "watermark_region_overlay", None)
+        wm_btn = getattr(gui, "watermark_region_btn", None)
+        wm_is_active = bool(
+            (wm_btn and wm_btn.isChecked())
+            or (wm_ov and (getattr(wm_ov, "_requested_visible", False) or getattr(wm_ov, "_user_customized", False)))
+        )
+        if wm_is_active and wm_ov and hasattr(wm_ov, "get_norm_rect"):
+            wm_rect = wm_ov.get_norm_rect()
+            if wm_rect and len(wm_rect) == 4 and wm_rect[2] > 0.01 and wm_rect[3] > 0.01:
+                if not hasattr(gui, "_video_watermark_rects"):
+                    gui._video_watermark_rects = {}
+                gui._video_watermark_rects[norm_p] = wm_rect
+                for sel_p in selected_paths:
+                    if sel_p:
+                        gui._video_watermark_rects[os.path.normpath(sel_p)] = wm_rect
+                QSettings("TankVideo", "TankVideoStudio").setValue(
+                    "watermark/default_rect", f"{wm_rect[0]:.4f},{wm_rect[1]:.4f},{wm_rect[2]:.4f},{wm_rect[3]:.4f}"
+                )
+                wm_saved = True
+        else:
+            # Xóa sạch cài đặt watermark mặc định nếu người dùng không bật, tránh tạo vết mờ ở giữa video
+            QSettings("TankVideo", "TankVideoStudio").remove("watermark/default_rect")
+            if hasattr(gui, "_video_watermark_rects") and norm_p in gui._video_watermark_rects:
+                gui._video_watermark_rects.pop(norm_p, None)
+
+        # 4. Ghi nhớ khung Đặt Logo nếu đang bật hoặc người dùng đã tùy biến vị trí
+        lp_ov = getattr(gui, "logo_placement_overlay", None)
+        lp_btn = getattr(gui, "logo_placement_btn", None)
+        lp_active = bool(
+            (lp_btn and lp_btn.isChecked())
+            or (lp_ov and (getattr(lp_ov, "_requested_visible", False) or getattr(lp_ov, "_user_customized", False)))
+        )
+        if lp_active and lp_ov and hasattr(lp_ov, "get_norm_rect"):
+            lp_rect = lp_ov.get_norm_rect()
+            if lp_rect and len(lp_rect) == 4 and lp_rect[2] > 0.01:
+                if not hasattr(gui, "_video_logo_placement_rects"):
+                    gui._video_logo_placement_rects = {}
+                gui._video_logo_placement_rects[norm_p] = lp_rect
+                for sel_p in selected_paths:
+                    if sel_p:
+                        gui._video_logo_placement_rects[os.path.normpath(sel_p)] = lp_rect
+                QSettings("TankVideo", "TankVideoStudio").setValue(
+                    "branding/logo_custom_rect", f"{lp_rect[0]:.4f},{lp_rect[1]:.4f},{lp_rect[2]:.4f},{lp_rect[3]:.4f}"
+                )
+
+        # 5. Ghi nhớ khung Đặt Watermark nếu đang bật hoặc người dùng đã tùy biến vị trí
+        wmp_ov = getattr(gui, "watermark_placement_overlay", None)
+        wmp_btn = getattr(gui, "watermark_placement_btn", None)
+        wmp_active = bool(
+            (wmp_btn and wmp_btn.isChecked())
+            or (wmp_ov and (getattr(wmp_ov, "_requested_visible", False) or getattr(wmp_ov, "_user_customized", False)))
+        )
+        if wmp_active and wmp_ov and hasattr(wmp_ov, "get_norm_rect"):
+            wmp_rect = wmp_ov.get_norm_rect()
+            if wmp_rect and len(wmp_rect) == 4 and wmp_rect[2] > 0.01:
+                if not hasattr(gui, "_video_wm_placement_rects"):
+                    gui._video_wm_placement_rects = {}
+                gui._video_wm_placement_rects[norm_p] = wmp_rect
+                for sel_p in selected_paths:
+                    if sel_p:
+                        gui._video_wm_placement_rects[os.path.normpath(sel_p)] = wmp_rect
+                QSettings("TankVideo", "TankVideoStudio").setValue(
+                    "branding/watermark_custom_rect", f"{wmp_rect[0]:.4f},{wmp_rect[1]:.4f},{wmp_rect[2]:.4f},{wmp_rect[3]:.4f}"
+                )
+
         ctrl = getattr(gui, "_batch_controller", None)
         if ctrl:
             for ws in ctrl.workspaces:
@@ -1783,7 +2665,6 @@ def build_preview_panel(gui, left_panel=None):
 
         ps = getattr(gui, "current_project_state", None)
         if ps and hasattr(ps, "settings"):
-            r_str = f"{rect[0]:.4f},{rect[1]:.4f},{rect[2]:.4f},{rect[3]:.4f}"
             ps.settings["ocr_subtitle_rect"] = r_str
             project_service = getattr(gui, "project_service", None)
             if project_service and hasattr(project_service, "save_project"):
@@ -1791,6 +2672,9 @@ def build_preview_panel(gui, left_panel=None):
                     project_service.save_project(ps)
                 except Exception:
                     pass
+
+        from utils.media_utils import save_media_pool_state
+        save_media_pool_state(gui)
 
         # Đổi giao diện nút báo thành công
         y_pct = int(rect[1] * 100)
@@ -1809,8 +2693,18 @@ def build_preview_panel(gui, left_panel=None):
                 )
         QtCore.QTimer.singleShot(2000, _reset_save_btn)
 
+        extra_msg = ""
+        if delogo_saved:
+            extra_msg += " + Xóa Logo"
+        if wm_saved:
+            extra_msg += " + Watermark"
+
+        sync_count = len(selected_paths)
         if hasattr(gui, "show_status_message"):
-            gui.show_status_message(f"💾 Đã ghi nhớ khung OCR cho {v_name} (y={y_pct}%, h={h_pct}%)", 3000)
+            if sync_count > 1:
+                gui.show_status_message(f"💾 Đã ghi nhớ OCR (y={y_pct}%){extra_msg} và đồng bộ cho {sync_count} video trong hàng đợi!", 3500)
+            else:
+                gui.show_status_message(f"💾 Đã ghi nhớ OCR (y={y_pct}%){extra_msg} cho {v_name}", 3000)
 
         # Cập nhật danh sách thẻ Media
         if hasattr(gui, "_refresh_media_pool_ui") and callable(gui._refresh_media_pool_ui):
@@ -2890,7 +3784,7 @@ def build_preview_panel(gui, left_panel=None):
     gui.subtitle_inspector_shell = inspector_shell
     inspector_shell.hide()
 
-    # --- RIGHT STUDIO PANEL (Phụ đề, Thuộc tính, Hòa trộn, Hiệu ứng - Chuẩn Ảnh 4) ---
+    # --- RIGHT STUDIO PANEL (Phụ đề & Thuộc tính) ---
     right_studio_panel = QFrame()
     right_studio_panel.setObjectName("rightStudioPanel")
     right_studio_panel.setMinimumWidth(300)
@@ -2911,22 +3805,14 @@ def build_preview_panel(gui, left_panel=None):
         "QPushButton { background: transparent; color: #ffffff; font-weight: 700; font-size: 12px; "
         "border: none; border-bottom: 2px solid #ff7b1a; padding: 4px 6px; }"
     )
-    tab_btn_style_inactive = (
-        "QPushButton { background: transparent; color: #71717a; font-weight: 500; font-size: 12px; "
-        "border: none; border-bottom: 2px solid transparent; padding: 4px 6px; } "
-        "QPushButton:hover { color: #d4d4d8; }"
-    )
 
+    # The former "Hòa trộn" / "Hiệu ứng" tabs were removed: they only
+    # re-parented the mask/video inspector cards (stealing them from
+    # ``gui.inspector_stack``) and opening them froze the UI.
     btn_tab_sub = QPushButton("Phụ đề")
-    btn_tab_blend = QPushButton("Hòa trộn")
-    btn_tab_effect = QPushButton("Hiệu ứng")
     btn_tab_sub.setStyleSheet(tab_btn_style_active)
-    btn_tab_blend.setStyleSheet(tab_btn_style_inactive)
-    btn_tab_effect.setStyleSheet(tab_btn_style_inactive)
 
     tab_bar_layout.addWidget(btn_tab_sub)
-    tab_bar_layout.addWidget(btn_tab_blend)
-    tab_bar_layout.addWidget(btn_tab_effect)
     tab_bar_layout.addStretch(1)
     studio_vbox.addLayout(tab_bar_layout)
 
@@ -3000,35 +3886,7 @@ def build_preview_panel(gui, left_panel=None):
 
     tab_sub_layout.addWidget(prop_card)
     studio_stack.addWidget(tab_sub_widget)
-
-    # --- TAB 1: Hòa trộn ---
-    tab_blend_widget = QWidget()
-    tab_blend_layout = QVBoxLayout(tab_blend_widget)
-    tab_blend_layout.setContentsMargins(6, 6, 6, 6)
-    blend_desc = QLabel("Cài đặt hòa trộn và độ mờ cho các lớp đang chọn.")
-    blend_desc.setStyleSheet("color: #a1a1aa; font-size: 11px;")
-    blend_desc.setWordWrap(True)
-    tab_blend_layout.addWidget(blend_desc)
-    tab_blend_layout.addWidget(_wrap_in_scroll(mask_inspector_card))
-    tab_blend_layout.addStretch(1)
-    studio_stack.addWidget(tab_blend_widget)
-
-    # --- TAB 2: Hiệu ứng (Video filters) ---
-    tab_effect_widget = QWidget()
-    tab_effect_layout = QVBoxLayout(tab_effect_widget)
-    tab_effect_layout.setContentsMargins(0, 0, 0, 0)
-    tab_effect_layout.addWidget(_wrap_in_scroll(video_inspector_card))
-    studio_stack.addWidget(tab_effect_widget)
-
-    def _switch_tab(idx):
-        studio_stack.setCurrentIndex(idx)
-        btn_tab_sub.setStyleSheet(tab_btn_style_active if idx == 0 else tab_btn_style_inactive)
-        btn_tab_blend.setStyleSheet(tab_btn_style_active if idx == 1 else tab_btn_style_inactive)
-        btn_tab_effect.setStyleSheet(tab_btn_style_active if idx == 2 else tab_btn_style_inactive)
-
-    btn_tab_sub.clicked.connect(lambda: _switch_tab(0))
-    btn_tab_blend.clicked.connect(lambda: _switch_tab(1))
-    btn_tab_effect.clicked.connect(lambda: _switch_tab(2))
+    studio_stack.setCurrentIndex(0)
 
     gui.right_studio_panel = right_studio_panel
 

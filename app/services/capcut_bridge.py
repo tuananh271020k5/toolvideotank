@@ -5,7 +5,6 @@ import json
 import os
 import re
 import subprocess
-from pathlib import Path
 from typing import Any, Callable
 
 from runtime_paths import bin_path, subprocess_text_kwargs
@@ -464,7 +463,6 @@ def export_subtitles_to_capcut_draft(
     """Tạo một dự án CapCut Draft mới chứa toàn bộ phụ đề đã dịch, tự động phân luồng Nam / Nữ."""
     import time
     import uuid
-    import re
 
     if not segments:
         raise ValueError("Danh sách phụ đề trống, không thể xuất sang CapCut.")
@@ -897,7 +895,7 @@ def launch_capcut_app(draft_folder: str = "") -> bool:
             except Exception:
                 pass
             return True
-    except Exception as exc:
+    except Exception:
         try:
             os.startfile(target)
             return True

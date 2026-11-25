@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -68,25 +69,61 @@ class ExtractionWorker(QThread):
 class VoiceGenderCheckWorker(QThread):
     completed = Signal(object, str)
     progress = Signal(str)
+    progress_percent = Signal(float, str)
+    stage_changed = Signal(str, str)
+    log_emitted = Signal(str)
+    cancelled = Signal()
 
-    def __init__(self, video_path, existing_cues=None, ocr_rect=None):
-        super().__init__()
+    def __init__(self, video_path, existing_cues=None, ocr_rect=None, parent=None):
+        super().__init__(parent)
         self.video_path = video_path
         self.existing_cues = existing_cues
         self.ocr_rect = ocr_rect
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
 
     def run(self):
         try:
+            from runtime_paths import optimize_windows_performance
+            optimize_windows_performance()
+        except Exception:
+            pass
+        try:
             from services.voice_gender_check_service import VoiceGenderCheckService
+
+            def _on_prog(pct_or_msg, maybe_msg=""):
+                if isinstance(pct_or_msg, (int, float)):
+                    pct = float(pct_or_msg)
+                    msg = str(maybe_msg) if maybe_msg else ""
+                    self.progress_percent.emit(pct, msg)
+                    self.progress.emit(f"{msg} ({int(pct)}%)")
+                    self.log_emitted.emit(f"[{int(pct)}%] {msg}")
+                else:
+                    self.progress.emit(str(pct_or_msg))
+                    self.log_emitted.emit(str(pct_or_msg))
 
             result = VoiceGenderCheckService().run(
                 self.video_path,
                 existing_cues=self.existing_cues,
-                progress=self.progress.emit,
+                progress=_on_prog,
                 ocr_rect=self.ocr_rect,
+                is_cancelled_func=lambda: self._cancel_event.is_set(),
             )
-            self.completed.emit(result, "")
+            if self._cancel_event.is_set() or (isinstance(result, dict) and result.get("cancelled")):
+                self.cancelled.emit()
+            else:
+                self.completed.emit(result, "")
+        except InterruptedError:
+            self.cancelled.emit()
         except Exception as exc:
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
             details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
             print(f"[Voice Gender Check] Failed:\n{details}")
             self.completed.emit({}, str(exc))
@@ -1123,7 +1160,7 @@ class VoiceSamplePreviewWorker(QThread):
                     "-c:a",
                     "pcm_s16le",
                     "-ar",
-                    "16000",
+                    "24000",
                     "-ac",
                     "1",
                     normalized_path,

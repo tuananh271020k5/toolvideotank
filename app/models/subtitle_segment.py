@@ -44,6 +44,8 @@ class SubtitleSegment:
     cluster_female_ratio: float = 0.5      # Tỉ lệ nữ trong cluster
     cluster_male_ratio: float = 0.5        # Tỉ lệ nam trong cluster
     manual_override: bool = False          # True nếu người dùng đã can thiệp chọn thủ công
+    ocr_box_index: int = 1                 # 1 = Khung 1 (Đáy), 2 = Khung 2 (Đỉnh)
+    position: str = "bottom"               # "bottom" | "top"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert segment to serializable dictionary."""
@@ -134,5 +136,6 @@ class SubtitleSegment:
             acoustic_hint=str(data.get("acoustic_hint", "") or "").strip(),
             cluster_female_ratio=float(data.get("cluster_female_ratio", 0.5) or 0.5),
             cluster_male_ratio=float(data.get("cluster_male_ratio", 0.5) or 0.5),
-            manual_override=is_manual,
+            ocr_box_index=int((data.get("ocr_box_index") if data.get("ocr_box_index") is not None else (data.get("metadata", {}).get("ocr_box_index") if isinstance(data.get("metadata"), dict) else None)) or (2 if str(data.get("position", "") or (data.get("metadata", {}).get("position") if isinstance(data.get("metadata"), dict) else "")).lower() == "top" else 1)),
+            position=str(data.get("position") or (data.get("metadata", {}).get("position") if isinstance(data.get("metadata"), dict) else "") or ("top" if int((data.get("ocr_box_index") if data.get("ocr_box_index") is not None else (data.get("metadata", {}).get("ocr_box_index") if isinstance(data.get("metadata"), dict) else 1)) or 1) == 2 else "bottom")).lower(),
         )

@@ -33,18 +33,50 @@ def build_main_window_ui(gui):
     root_layout.setSpacing(4)
     gui.root_layout = root_layout
 
-    scroll_area = _build_left_panel(gui)
+    left_panel = _build_left_panel(gui)
     root_layout.addWidget(_build_header_bar(gui))
 
-    content_layout = QHBoxLayout()
-    content_layout.setSpacing(4)
-    gui.content_layout = content_layout
+    from PySide6.QtWidgets import QSplitter
+    main_splitter = QSplitter(Qt.Horizontal)
+    main_splitter.setObjectName("mainContentSplitter")
+    main_splitter.setHandleWidth(6)
+    main_splitter.setStyleSheet(
+        "QSplitter::handle:horizontal { background: #141519; border-left: 1px solid #27282d; border-right: 1px solid #27282d; width: 6px; } "
+        "QSplitter::handle:horizontal:hover { background: #ff7b1a; border-color: #ff7b1a; }"
+    )
+    gui.main_splitter = main_splitter
+    gui.content_layout = main_splitter
     right_panel = build_preview_panel(gui)
 
-    content_layout.addWidget(scroll_area)
-    content_layout.addWidget(right_panel, 1)
+    main_splitter.addWidget(left_panel)
+    main_splitter.addWidget(right_panel)
+    main_splitter.setStretchFactor(0, 0)
+    main_splitter.setStretchFactor(1, 1)
+    main_splitter.setCollapsible(0, False)
+    main_splitter.setCollapsible(1, False)
+    main_splitter.splitterMoved.connect(lambda pos, index: QTimer.singleShot(0, gui.sync_left_panel_container_width))
+
+    # Tải kích thước đã lưu hoặc đặt kích thước mặc định cân đối
+    from PySide6.QtCore import QSettings
+    saved_sizes = QSettings("TankVideo", "TankVideoStudio").value("main_window/splitter_sizes", None)
+    if saved_sizes and isinstance(saved_sizes, (list, tuple)) and len(saved_sizes) == 2:
+        try:
+            main_splitter.setSizes([int(saved_sizes[0]), int(saved_sizes[1])])
+        except Exception:
+            main_splitter.setSizes([380, 1200])
+    else:
+        main_splitter.setSizes([380, 1200])
+
+    def _save_splitter_sizes(pos, idx):
+        try:
+            s_sizes = main_splitter.sizes()
+            QSettings("TankVideo", "TankVideoStudio").setValue("main_window/splitter_sizes", s_sizes)
+        except Exception:
+            pass
+    main_splitter.splitterMoved.connect(_save_splitter_sizes)
+
     gui.right_panel = right_panel
-    root_layout.addLayout(content_layout, 1)
+    root_layout.addWidget(main_splitter, 1)
 
     _connect_ui_signals(gui)
     if hasattr(gui, "left_panel_stack"):
@@ -126,6 +158,25 @@ def _build_header_bar(gui):
     gui.pipeline_b_create_btn.clicked.connect(lambda: getattr(gui, "start_pipeline_b_flow", lambda: None)())
     layout.addWidget(gui.pipeline_b_create_btn)
 
+    gui.run_dual_ocr_btn = QPushButton("🎬 Tạo video 2 Khung OCR")
+    gui.run_dual_ocr_btn.setObjectName("runDualOcrActionBtn")
+    gui.run_dual_ocr_btn.setMinimumHeight(30)
+    gui.run_dual_ocr_btn.setMinimumWidth(165)
+    gui.run_dual_ocr_btn.setToolTip(
+        "Tạo video 1 giọng với 2 khung OCR (Đỉnh & Đáy):\n"
+        "1. Quét độc lập cả 2 khung OCR trên video\n"
+        "2. Dịch câu thoại sang tiếng Việt\n"
+        "3. Lồng tiếng 1 giọng đọc AI duy nhất\n"
+        "4. Che mờ động: chữ ở khung nào hiện thì khung đó mới mờ, hết chữ biến mất 100%"
+    )
+    gui.run_dual_ocr_btn.setStyleSheet(
+        "QPushButton { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #d97706, stop:1 #b45309); "
+        "color: #fff; font-weight: 700; font-size: 11px; border: none; border-radius: 4px; padding: 5px 12px; } "
+        "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f59e0b, stop:1 #d97706); }"
+    )
+    gui.run_dual_ocr_btn.clicked.connect(lambda: getattr(gui, "start_dual_ocr_single_voice_flow", lambda: None)())
+    layout.addWidget(gui.run_dual_ocr_btn)
+
     gui.run_all_btn.setText("▶ Tạo video")
     gui.run_all_btn.setMinimumHeight(30)
     gui.run_all_btn.setMinimumWidth(110)
@@ -184,8 +235,13 @@ def _build_header_bar(gui):
     gui.download_subtitle_action.triggered.connect(gui.download_subtitle)
     gui.download_original_action = more_menu.addAction("Export Source SRT…")
     gui.download_original_action.triggered.connect(gui.download_original_script)
+    gui.export_sub_only_action = more_menu.addAction("🎬 Xuất video chỉ có Phụ đề (Không lồng tiếng)...")
+    gui.export_sub_only_action.triggered.connect(lambda: getattr(gui, "export_subtitle_only_video", lambda: None)())
     gui.preview_5s_action = more_menu.addAction("Fast Preview (5 seconds)")
     gui.preview_5s_action.triggered.connect(gui.preview_5s_btn.click)
+    more_menu.addSeparator()
+    gui.cut_video_action = more_menu.addAction("✂️ Cắt & Chia video (Shorts / Clip)...")
+    gui.cut_video_action.triggered.connect(lambda: getattr(gui, "open_video_cutter_dialog", lambda: None)())
     more_menu.addSeparator()
     gui.update_action = more_menu.addAction("🚀 Kiểm tra cập nhật...")
     gui.update_action.triggered.connect(lambda: getattr(gui, "open_update_dialog", lambda: None)())
@@ -384,13 +440,16 @@ def _build_left_panel(gui):
     sidebar = _build_nav_sidebar(gui)
     wrapper_layout.addWidget(sidebar)
 
+    left_panel_wrapper.setMinimumWidth(316)
+    left_panel_wrapper.setMaximumWidth(1256)
+
     # 2. Vùng cuộn nội dung bên phải sidebar
     scroll_area = QScrollArea()
     gui.left_panel_scroll_area = scroll_area
     scroll_area.setObjectName("leftPanelArea")
     scroll_area.setWidgetResizable(True)
-    scroll_area.setMinimumWidth(300)
-    scroll_area.setMaximumWidth(520)
+    scroll_area.setMinimumWidth(260)
+    scroll_area.setMaximumWidth(1200)
     scroll_area.setAlignment(Qt.AlignTop | Qt.AlignLeft)
     scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     scroll_area.setFrameShape(QFrame.NoFrame)
@@ -428,7 +487,7 @@ def _build_left_panel(gui):
     if hasattr(gui, "left_master_stack"):
         gui.left_master_stack.currentChanged.connect(_sync_sidebar_from_master_idx)
     elif hasattr(gui, "left_panel_stack"):
-        gui.left_panel_stack.currentChanged.connect(_sync_sidebar_from_tab_idx)
+        gui.left_panel_stack.currentChanged.connect(_sync_sidebar_from_master_idx)
 
     wrapper_layout.addWidget(scroll_area, 1)
     gui.left_panel_wrapper = left_panel_wrapper
@@ -527,6 +586,10 @@ def _connect_ui_signals(gui):
         gui.delogo_region_btn.clicked.connect(gui.toggle_delogo_overlay_visibility)
     if hasattr(gui, "watermark_region_btn"):
         gui.watermark_region_btn.clicked.connect(gui.toggle_watermark_overlay_visibility)
+    if hasattr(gui, "logo_placement_btn"):
+        gui.logo_placement_btn.clicked.connect(gui.toggle_logo_placement_overlay)
+    if hasattr(gui, "watermark_placement_btn"):
+        gui.watermark_placement_btn.clicked.connect(gui.toggle_watermark_placement_overlay)
     if hasattr(gui, "ocr_translator_btn"):
         gui.ocr_translator_btn.toggled.connect(gui.toggle_ocr_translator)
     if hasattr(gui, "ocr_translator_overlay"):

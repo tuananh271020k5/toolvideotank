@@ -5,27 +5,55 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
 
-from runtime_paths import temp_path
+try:
+    from runtime_paths import (
+        bundle_root,
+        subprocess_hidden_kwargs,
+        temp_path,
+        workspace_root,
+    )
+except ImportError:
+    from app.runtime_paths import (
+        bundle_root,
+        subprocess_hidden_kwargs,
+        temp_path,
+        workspace_root,
+    )
 
 
 class GenderService:
-    """Load the packaged detector once and classify subtitle intervals in batch."""
+    """Load the packaged detector once and classify subtitle intervals in batch.
+    
+    Supports both in-process execution (when PyTorch is available in current env)
+    and external Python subprocess execution (for standalone PyInstaller builds).
+    """
 
     _detector = None
     _load_lock = Lock()
     _inference_lock = Lock()
+    _execution_mode = None  # "in_process" | "external"
+    _external_python_path = None
 
     def __init__(self, package_dir: str | os.PathLike[str] | None = None):
         root = Path(__file__).resolve().parents[2]
+        b_root = Path(bundle_root())
+        w_root = Path(workspace_root())
+
         candidates = [
             Path(package_dir) if package_dir else None,
+            b_root / "gender_voice_ai_windows_package",
+            w_root / "gender_voice_ai_windows_package",
+            w_root.parent.parent / "gender_voice_ai_windows_package",
             root / "ai_models" / "gender_ai",
             root / "gender_voice_ai_windows_package",
+            b_root / "ai_models" / "gender_ai",
         ]
         self.package_dir = next((path.resolve() for path in candidates if path and path.is_dir()), None)
         if self.package_dir is None:
@@ -39,39 +67,104 @@ class GenderService:
             raise RuntimeError("Gói Gender AI thiếu classifier hoặc runtime_models.")
         self.accept_confidence = float(os.getenv("GENDER_AI_ACCEPT_CONFIDENCE", "0.65"))
 
+    def _resolve_external_python(self) -> str | None:
+        """Find an external Python interpreter that has torch and torchaudio installed."""
+        w_root = Path(workspace_root())
+        candidates = [
+            os.getenv("GENDER_AI_PYTHON", "").strip(),
+            str(w_root / ".venv" / "Scripts" / "python.exe"),
+            str(w_root.parent.parent / ".venv" / "Scripts" / "python.exe"),
+            r"D:\tankvideo\tankvideo\.venv\Scripts\python.exe",
+            os.getenv("VIENEU_PYTHON", "").strip(),
+        ]
+        for py in candidates:
+            if py and os.path.isfile(py):
+                # Verify that this python can actually run torchaudio
+                try:
+                    res = subprocess.run(
+                        [py, "-c", "import torch, torchaudio; print('OK')"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        **subprocess_hidden_kwargs(),
+                    )
+                    if res.returncode == 0 and "OK" in res.stdout:
+                        return os.path.abspath(py)
+                except Exception:
+                    pass
+        return None
+
+    def _find_worker_script(self) -> str:
+        """Locate app/gender_worker.py in bundle or workspace."""
+        b_root = Path(bundle_root())
+        w_root = Path(workspace_root())
+        candidates = [
+            b_root / "app" / "gender_worker.py",
+            w_root / "app" / "gender_worker.py",
+            w_root.parent.parent / "app" / "gender_worker.py",
+            Path(__file__).resolve().parent.parent / "gender_worker.py",
+        ]
+        for c in candidates:
+            if c.is_file():
+                return str(c.resolve())
+        raise RuntimeError("Không tìm thấy file app/gender_worker.py.")
+
     def load(self, progress: Callable[[str], None] | None = None):
-        if type(self)._detector is not None:
+        if type(self)._execution_mode is not None:
             return type(self)._detector
+
         notify = progress or (lambda _message: None)
         with type(self)._load_lock:
-            if type(self)._detector is not None:
+            if type(self)._execution_mode is not None:
                 return type(self)._detector
-            notify("Đang nạp Gender AI offline (lần đầu có thể mất vài phút)…")
+
+            notify("Đang kiểm tra môi trường Gender AI offline…")
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
             package_text = str(self.package_dir)
             if package_text not in sys.path:
                 sys.path.insert(0, package_text)
+
+            # 1. Thử nạp trực tiếp in-process (nhanh nhất khi chạy qua python .venv)
+            can_in_process = False
             try:
+                import torch
+                import torchaudio
                 from gender_detector import GenderDetector
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Thiếu thư viện Gender AI. Hãy cài torch, torchaudio, "
-                    "speechbrain và transformers vào .venv."
-                ) from exc
-            import torch
-            try:
-                torch.set_num_threads(min(8, os.cpu_count() or 4))
-            except Exception:
-                pass
-            type(self)._detector = GenderDetector(
-                gender_model_path=self.classifier_path,
-                cache_dir=self.runtime_models,
-                device="cpu",
-                min_gender_confidence=self.accept_confidence,
+                can_in_process = True
+            except ImportError:
+                can_in_process = False
+
+            if can_in_process:
+                try:
+                    torch.set_num_threads(min(8, os.cpu_count() or 4))
+                except Exception:
+                    pass
+                type(self)._detector = GenderDetector(
+                    gender_model_path=self.classifier_path,
+                    cache_dir=self.runtime_models,
+                    device="cpu",
+                    min_gender_confidence=self.accept_confidence,
+                )
+                type(self)._execution_mode = "in_process"
+                notify("Đã nạp Gender AI offline (In-Process).")
+                print("[GenderService] Loaded Gender AI in-process mode.")
+                return type(self)._detector
+
+            # 2. Nếu in-process thiếu Torch (như trong PyInstaller .exe), tìm external Python
+            ext_python = self._resolve_external_python()
+            if ext_python:
+                type(self)._external_python_path = ext_python
+                type(self)._execution_mode = "external"
+                notify("Đã kết nối Gender AI qua External Python worker.")
+                print(f"[GenderService] Using external Python for Gender AI: {ext_python}")
+                return None
+
+            # 3. Không có cả 2 -> Báo lỗi để chuyển sang fallback
+            raise RuntimeError(
+                "Thiếu thư viện Gender AI và không tìm thấy Python môi trường ngoài. "
+                "Hãy cài torch, torchaudio, speechbrain vào .venv hoặc đặt GENDER_AI_PYTHON trong .env."
             )
-            notify("Đã nạp Gender AI offline.")
-            return type(self)._detector
 
     @staticmethod
     def normalize_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -212,8 +305,53 @@ class GenderService:
         detector = self.load(notify)
         attempts, meta_by_id = self._vad_aware_attempts(clean_cues, vad_intervals)
         notify(f"Đang nhận diện Nam/Nữ cho {len(clean_cues)} câu bằng Gender AI…")
-        with type(self)._inference_lock:
-            raw_results = list(detector.detect_segments(audio_path, attempts) or [])
+
+        raw_results: list[dict[str, Any]] = []
+
+        if type(self)._execution_mode == "in_process" and detector is not None:
+            with type(self)._inference_lock:
+                raw_results = list(detector.detect_segments(audio_path, attempts) or [])
+        elif type(self)._execution_mode == "external" and type(self)._external_python_path:
+            worker_script = self._find_worker_script()
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as in_f:
+                json.dump({
+                    "audio_path": os.path.abspath(audio_path),
+                    "attempts": attempts,
+                    "package_dir": str(self.package_dir),
+                    "accept_confidence": self.accept_confidence,
+                }, in_f, ensure_ascii=False)
+                in_path = in_f.name
+
+            out_path = in_path + ".out.json"
+            try:
+                cmd = [
+                    type(self)._external_python_path,
+                    worker_script,
+                    "-i", in_path,
+                    "-o", out_path,
+                ]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    **subprocess_hidden_kwargs(),
+                )
+                if os.path.isfile(out_path):
+                    with open(out_path, "r", encoding="utf-8") as out_f:
+                        raw_results = json.load(out_f)
+                else:
+                    raise RuntimeError(f"Worker did not produce output: {proc.stderr}")
+            finally:
+                if os.path.isfile(in_path):
+                    try: os.remove(in_path)
+                    except OSError: pass
+                if os.path.isfile(out_path):
+                    try: os.remove(out_path)
+                    except OSError: pass
+        else:
+            raise RuntimeError("Chưa khởi tạo chế độ thực thi Gender AI.")
+
         grouped: dict[str, list[dict[str, Any]]] = {}
         for result in raw_results:
             base_id = str(result.get("id", "")).split(":", 1)[0]
@@ -278,7 +416,7 @@ class GenderService:
                 "source": "gender-ai-windows",
             })
 
-        # Lưu kết quả tính toán vào cache để tái sử dụng ngay lập tức
+        # Lưu cache để các lần sau chạy tức thì
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(resolved, f, ensure_ascii=False, indent=2)

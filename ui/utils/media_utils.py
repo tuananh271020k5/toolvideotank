@@ -514,12 +514,16 @@ def save_media_pool_state(gui):
         return
     voice_configs = getattr(gui, "_video_voice_configs", {})
     ocr_rects = getattr(gui, "_video_ocr_rects", {})
+    delogo_rects = getattr(gui, "_video_delogo_rects", {})
+    watermark_rects = getattr(gui, "_video_watermark_rects", {})
 
     from runtime_paths import workspace_root
     save_data = {
         "media_pool": pool,
         "video_voice_configs": voice_configs,
         "video_ocr_rects": ocr_rects,
+        "video_delogo_rects": delogo_rects,
+        "video_watermark_rects": watermark_rects,
         "updated_at": time.time(),
     }
 
@@ -557,6 +561,8 @@ def save_media_pool_state(gui):
         ps.settings["project_media_pool"] = pool
         ps.settings["video_voice_configs"] = voice_configs
         ps.settings["video_ocr_rects"] = ocr_rects
+        ps.settings["video_delogo_rects"] = delogo_rects
+        ps.settings["video_watermark_rects"] = watermark_rects
         project_service = getattr(gui, "project_service", None)
         if project_service and hasattr(project_service, "save_project"):
             try:
@@ -592,6 +598,8 @@ def restore_media_pool_state(gui, target_video_path="") -> bool:
                 "media_pool": ps.settings.get("project_media_pool", []),
                 "video_voice_configs": ps.settings.get("video_voice_configs", {}),
                 "video_ocr_rects": ps.settings.get("video_ocr_rects", {}),
+                "video_delogo_rects": ps.settings.get("video_delogo_rects", {}),
+                "video_watermark_rects": ps.settings.get("video_watermark_rects", {}),
             }
 
     # 3. Thử tìm trong session_media_pool.json
@@ -630,6 +638,14 @@ def restore_media_pool_state(gui, target_video_path="") -> bool:
         gui._video_ocr_rects = {}
     gui._video_ocr_rects.update(save_data.get("video_ocr_rects") or {})
 
+    if not hasattr(gui, "_video_delogo_rects"):
+        gui._video_delogo_rects = {}
+    gui._video_delogo_rects.update(save_data.get("video_delogo_rects") or {})
+
+    if not hasattr(gui, "_video_watermark_rects"):
+        gui._video_watermark_rects = {}
+    gui._video_watermark_rects.update(save_data.get("video_watermark_rects") or {})
+
     return True
 
 
@@ -653,15 +669,15 @@ def browse_video(gui, file_path=None):
     if not file_path:
         return
 
-    # 1. Lưu lại khung OCR và Media Pool của video cũ trước khi switch
+    # 1. Lưu lại khung OCR, Delogo, Watermark và Media Pool của video cũ trước khi switch
     old_video = getattr(gui, "_current_video_path", "")
+    norm_old = os.path.normpath(old_video) if old_video else ""
     overlay = getattr(gui, "ocr_region_overlay", None)
-    if old_video and overlay and hasattr(overlay, "get_norm_rect"):
+    if norm_old and overlay and hasattr(overlay, "get_norm_rect"):
         try:
             old_rect = overlay.get_norm_rect()
             if not hasattr(gui, "_video_ocr_rects"):
                 gui._video_ocr_rects = {}
-            norm_old = os.path.normpath(old_video)
             gui._video_ocr_rects[norm_old] = old_rect
             ctrl = getattr(gui, "_batch_controller", None)
             if ctrl:
@@ -679,6 +695,26 @@ def browse_video(gui, file_path=None):
                         project_service.save_project(ps)
                     except Exception:
                         pass
+        except Exception:
+            pass
+
+    # Lưu khung Xóa Logo của video cũ
+    delogo_ov = getattr(gui, "delogo_region_overlay", None)
+    if norm_old and delogo_ov and hasattr(delogo_ov, "get_norm_rect"):
+        try:
+            if not hasattr(gui, "_video_delogo_rects"):
+                gui._video_delogo_rects = {}
+            gui._video_delogo_rects[norm_old] = delogo_ov.get_norm_rect()
+        except Exception:
+            pass
+
+    # Lưu khung Xóa Watermark của video cũ
+    wm_ov = getattr(gui, "watermark_region_overlay", None)
+    if norm_old and wm_ov and hasattr(wm_ov, "get_norm_rect"):
+        try:
+            if not hasattr(gui, "_video_watermark_rects"):
+                gui._video_watermark_rects = {}
+            gui._video_watermark_rects[norm_old] = wm_ov.get_norm_rect()
         except Exception:
             pass
 
@@ -727,11 +763,27 @@ def browse_video(gui, file_path=None):
     if len(getattr(gui, "project_media_pool", [])) <= 1:
         restore_media_pool_state(gui, file_path)
 
-    # 2. Khôi phục khung OCR riêng của video mới vừa chọn
+    # 2. Khôi phục khung OCR, Delogo và Watermark riêng của video mới vừa chọn
+    norm_new = os.path.normpath(file_path) if file_path else ""
     if overlay and hasattr(overlay, "restore_for_video"):
         overlay.restore_for_video(file_path)
     if hasattr(gui, "_sync_ocr_overlay"):
         gui._sync_ocr_overlay()
+
+    # Phục hồi khung Xóa Logo nếu có cấu hình riêng cho video này
+    delogo_ov = getattr(gui, "delogo_region_overlay", None)
+    if delogo_ov and hasattr(delogo_ov, "set_norm_rect") and norm_new:
+        dl_rect = getattr(gui, "_video_delogo_rects", {}).get(norm_new)
+        if dl_rect and len(dl_rect) == 4:
+            delogo_ov.set_norm_rect(*dl_rect)
+
+    # Phục hồi khung Xóa Watermark nếu có cấu hình riêng cho video này
+    wm_ov = getattr(gui, "watermark_region_overlay", None)
+    if wm_ov and hasattr(wm_ov, "set_norm_rect") and norm_new:
+        wm_rect = getattr(gui, "_video_watermark_rects", {}).get(norm_new)
+        if wm_rect and len(wm_rect) == 4:
+            wm_ov.set_norm_rect(*wm_rect)
+
     if hasattr(gui, "_refresh_media_pool_ui") and callable(gui._refresh_media_pool_ui):
         gui._refresh_media_pool_ui()
 

@@ -14,7 +14,7 @@ import platform
 import subprocess
 import time
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 # Khóa bí mật nội bộ của TankVideo để chống giả mạo key (Secret Salt)
@@ -64,8 +64,8 @@ def get_hardware_machine_id() -> str:
 
 
 # Cấu hình mặc định Supabase Cloud
-DEFAULT_SUPABASE_URL = "https://mgtrrinjjkpnjxkjrtyh.supabase.co"
-DEFAULT_SUPABASE_KEY = "sb_publishable_VMs5RD9UEoi8PUhHpX6VyQ_hbua75qa"
+DEFAULT_SUPABASE_URL = "https://wffbglilhgdxplgymzen.supabase.co"
+DEFAULT_SUPABASE_KEY = "sb_publishable_EaocVRzxW41ymt_z2hmILw_J4rtrxu0"
 
 
 class LicenseService:
@@ -363,7 +363,7 @@ class LicenseService:
                 os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
                 with open(target_path, "w", encoding="utf-8") as f:
                     json.dump(record, f, indent=2)
-            except Exception as exc:
+            except Exception:
                 pass
         return True, f"Kích hoạt thành công gói {verify_res['plan']}! Hạn dùng đến: {verify_res['expires_at']}."
 

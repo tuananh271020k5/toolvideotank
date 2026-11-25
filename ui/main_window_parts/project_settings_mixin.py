@@ -12,22 +12,14 @@ except ImportError:
 
 
 import os
-import shutil
-from typing import Any
 
-from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import (
-    QPushButton, QSlider, QProgressBar, QLabel, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox, QTabWidget, QSplitter, QScrollArea, QFrame, QDialog,
-    QDialog,
-    QFileDialog,
-    QFormLayout,
-    QGroupBox,
+    QComboBox, QFrame, QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -142,10 +134,11 @@ class ProjectSettingsMixin:
         region_label = QLabel("Vị trí phụ đề OCR:")
         region_label.setVisible(current_engine == "ocr")
         region_combo = QComboBox(dialog)
+        region_combo.addItem("Thông minh đa vùng (Đỉnh & Đáy, né lề trái)", "smart")
         region_combo.addItem("Phía dưới (mặc định)", "bottom")
         region_combo.addItem("Phía trên", "top")
         region_combo.addItem("Toàn khung hình", "full")
-        current_region = (os.getenv("OCR_SUBTITLE_REGION") or "bottom").strip().lower()
+        current_region = (os.getenv("OCR_SUBTITLE_REGION") or "smart").strip().lower()
         idx = region_combo.findData(current_region)
         if idx >= 0:
             region_combo.setCurrentIndex(idx)

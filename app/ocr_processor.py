@@ -6,7 +6,7 @@ import time
 import cv2
 import numpy as np
 
-from runtime_paths import bin_path, subprocess_hidden_kwargs, subprocess_text_kwargs
+from runtime_paths import bin_path, subprocess_text_kwargs
 
 _OCR_ENGINE = None
 _OCR_ENGINE_LOCK = None
@@ -77,6 +77,19 @@ def _enable_reusable_detector_preprocess(engine):
 MAX_CROP_WIDTH = 640
 EMPTY_TOLERANCE = 2
 EXACT_HASH_THRESHOLD = 0.15
+# Burned-in subtitles are usually white glyphs with a dark outline.  The
+# stroke mask below keeps only bright pixels that touch a dark outline, so
+# a bright background (light floor, sky, walls) cannot hide a text change.
+STROKE_HASH_THRESHOLD = 0.12
+
+
+def _ocr_force_refresh_seconds() -> float:
+    """Max time a frame may reuse the previous OCR result (safety net)."""
+    try:
+        value = float(os.getenv("CAPCAP_OCR_FORCE_REFRESH_S", "2.0") or 2.0)
+    except ValueError:
+        value = 2.0
+    return value if value > 0 else 0.0
 _OCR_MODEL_SETS = (
     (
         "PP-OCRv4",
@@ -102,11 +115,23 @@ _OCR_WATERMARK_PATTERNS = [
     re.compile(r"专店"),
     re.compile(r"剧情(?:需要)?\s*请勿模仿"),
     re.compile(r"请勿模仿"),
-    re.compile(r"全剧(?:纯属)?虚构"),
+    re.compile(r"切勿模仿(?:不当行为)?"),
+    re.compile(r"(?:本作品|故事|全剧|本剧|本片|本视频)?\s*纯属虚构"),
     re.compile(r"请勿当真"),
     re.compile(r"仅供娱乐"),
     re.compile(r"谨防上当受骗"),
+    re.compile(r"特别声明"),
     re.compile(r"备注\s*[:：].*"),
+    re.compile(r"以下内容可能含有.*"),
+    re.compile(r"请谨慎观看"),
+    re.compile(r"(?:作品中出现的)?人物[、,\s]*事件.*"),
+    re.compile(r"均为剧情需要.*"),
+    re.compile(r"请勿带入(?:到)?现实"),
+    re.compile(r"坚持正确的价值观"),
+    re.compile(r"无不良引导"),
+    re.compile(r"如有雷同\s*纯属巧合"),
+    re.compile(r"禁止模仿"),
+    re.compile(r"未成年人.*观看"),
 ]
 
 
@@ -277,7 +302,16 @@ def get_crop_normalized_rect(image_shape, region="bottom") -> tuple[float, float
         except Exception:
             pass
     effective_region = (os.getenv("OCR_SUBTITLE_REGION") or region or "bottom").strip().lower()
-    if effective_region == "bottom":
+    if effective_region in ("smart", "dual", "auto", "both"):
+        # Chế độ Thông Minh Đa Vùng (Universal Smart Dialogue-Zone):
+        # Tự động chừa lề trái né cột disclaimer dọc & watermark Douyin ID (@tên_kênh).
+        # Quét trọn vẹn cả dải thoại trên đỉnh (8%-38%) và dải thoại dưới đáy (58%-94%).
+        left_m = 0.14 if h > w else 0.08
+        right_m = 0.02 if h > w else 0.04
+        top_m = 0.08
+        bot_m = 0.94
+        return (left_m, top_m, round(1.0 - left_m - right_m, 4), round(bot_m - top_m, 4))
+    elif effective_region == "bottom":
         if h > w:
             top_r = float(os.getenv("OCR_VERTICAL_TOP_RATIO", "0.56"))
             bot_r = float(os.getenv("OCR_VERTICAL_BOTTOM_RATIO", "0.74"))
@@ -309,7 +343,17 @@ def crop_subtitle_region(image, region="bottom"):
         except Exception:
             pass
     effective_region = (os.getenv("OCR_SUBTITLE_REGION") or region or "bottom").strip().lower()
-    if effective_region == "bottom":
+    if effective_region in ("smart", "dual", "auto", "both"):
+        left_m = 0.14 if h > w else 0.08
+        right_m = 0.02 if h > w else 0.04
+        top_m = 0.08
+        bot_m = 0.94
+        x1 = int(w * left_m)
+        x2 = int(w * (1.0 - right_m))
+        y1 = int(h * top_m)
+        y2 = int(h * bot_m)
+        return image[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+    elif effective_region == "bottom":
         if h > w:
             # Vertical short-drama video (9:16): dialogue subtitles are placed in the lower-middle band (56% to 74% height)
             # This precisely avoids bottom receipts, letters, TikTok progress bars, and chest clothing prints.
@@ -344,6 +388,25 @@ def _crop_hash(image):
     return np.bitwise_or(text_mask, edges)
 
 
+_STROKE_KERNEL = np.ones((5, 5), dtype=np.uint8)
+
+
+def _stroke_hash(image):
+    """Mask of outlined subtitle glyphs (bright core touching a dark edge)."""
+    if image is None or image.size == 0:
+        return np.zeros((64, 256), dtype=np.uint8)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape[:2]
+    if w > 640:
+        scale = 640.0 / float(w)
+        gray = cv2.resize(gray, (640, max(8, int(h * scale))), interpolation=cv2.INTER_AREA)
+    bright = gray >= 200
+    dark = cv2.dilate((gray <= 80).astype(np.uint8), _STROKE_KERNEL) > 0
+    stroke = (bright & dark).astype(np.uint8) * 255
+    small = cv2.resize(stroke, (256, 64), interpolation=cv2.INTER_AREA)
+    return (small > 40).astype(np.uint8) * 255
+
+
 def _hamming_distance(h1, h2):
     if h1 is None or h2 is None:
         return 1.0
@@ -356,6 +419,7 @@ def _sanitize_ocr_line(text: str) -> str:
     if not cleaned:
         return ""
     cleaned = _OCR_HANDLE_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"[@#]?\s*阿[怖饰]\s*", " ", cleaned)
     for pattern in _OCR_WATERMARK_PATTERNS:
         cleaned = pattern.sub(" ", cleaned)
     cleaned = re.sub(r"^\d+[\.\s、:：]+", "", cleaned)
@@ -376,14 +440,25 @@ def _sanitize_ocr_line(text: str) -> str:
         # e.g., '咋7' -> '咋了', '来7' -> '来了', '对J' -> '对了', '太7' -> '太了'
         cleaned = re.sub(r"(?<=[\u4e00-\u9fff\u3400-\u4dbf])\s*[7J](?=[^\d]|$)", "了", cleaned)
 
-    # Filter out non-dialogue text (food receipts, medication deliveries, address headers, letter salutations, ads, student workbooks/textbook covers)
+    # Filter out non-dialogue text (disclaimers, food receipts, medication deliveries, address headers, ads)
     if re.search(
-        r"(?:份餐具|外卖|送药|医药也快|A栋|a栋|To\s*[\u4e00-\u9fff]|排骨.*必涌泉|"
+        r"(?:虚构|唇构|模仿|摸仿|谨慎观看|剧情需要|剧情所设|为.*设|无不良引导|价值观|恐怖|惊悚|带[入人].*现实|本[个作][品山田]|品中出现|作品中出现|"
+        r"出气方|均为.*设|某些行为|切勿|请勿|纯属|特别声明|禁止模仿|仅供娱乐|"
+        r"份餐具|外卖|送药|医药也快|A栋|a栋|To\s*[\u4e00-\u9fff]|排骨.*必涌泉|"
         r"想卖闲置|卖闲置|闲置.*嫌麻烦|转转.*二手|二手.*转卖|点击评论区|主页有|评论区置顶|关注公众号|私信获取|"
         r"山东名师|名师出|课时证|助力学生|学生得优|情境设|真题度|养提升|未养提升|究创新|农究创新|"
         r"视频精讲|五年级|六年级|七年级|八年级|九年级|初中数学|小学数学|高中数学|同步练习|模拟卷|必刷题|重难点手册)",
         cleaned,
     ):
+        return ""
+
+    # Bảng cảnh báo kiểm duyệt / disclaimer thường là một khối văn bản rất dài (>= 22 chữ Hán)
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", cleaned))
+    if cjk_count >= 22:
+        return ""
+
+    # Lọc watermark tên kênh ngắn ở góc (như "阿桥", "阿怖")
+    if cleaned in {"阿桥", "阿怖", "阿饰", "关注", "点赞", "收藏", "转发"}:
         return ""
 
     # Discard isolated single Chinese character (unless common modal particles/interjections)
@@ -405,15 +480,36 @@ def _sanitize_ocr_line(text: str) -> str:
 
 
 def _is_blank_region(image):
+    if image is None or image.size == 0 or image.shape[0] < 4 or image.shape[1] < 4:
+        return True
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
-    if float(lap.var()) < 15.0:
+    lap_var = float(lap.var())
+    if lap_var < 8.0:
         return True
-    bright_ratio = float(np.sum(gray > 180)) / gray.size
-    # Small, single-character white subtitles can occupy only about 0.05% of a
-    # expanded crop.
-    if bright_ratio > 0.0003:
+
+    total_px = float(gray.size)
+
+    # 1. Chữ màu sáng (trắng, vàng sáng, xám sáng)
+    if float(np.sum(gray > 160)) / total_px > 0.0003:
         return False
+
+    # 2. Chữ có màu sắc nổi bật/bão hòa cao (xanh lá neon, đỏ, vàng, cam, tím, cyan...)
+    # Trong không gian BGR: kênh màu trội hơn hẳn các kênh khác
+    b = image[:, :, 0].astype(np.int16)
+    g = image[:, :, 1].astype(np.int16)
+    r = image[:, :, 2].astype(np.int16)
+    max_c = np.maximum(np.maximum(b, g), r)
+    min_c = np.minimum(np.minimum(b, g), r)
+    color_diff = max_c - min_c
+    if float(np.sum((max_c >= 95) & (color_diff >= 30))) / total_px > 0.0004:
+        return False
+
+    # 3. Cạnh nét rõ rệt kèm độ tương phản cục bộ (lap_var >= 28.0)
+    contrast = float(np.max(gray) - np.min(gray))
+    if lap_var >= 28.0 and contrast >= 45:
+        return False
+
     return True
 
 
@@ -464,46 +560,85 @@ def ocr_frame(engine, image, profiling=None, return_details=False, crop_norm=Non
     elif not isinstance(raw_scores, (list, tuple)):
         raw_scores = list(raw_scores)
 
+    parsed_items = []
     for idx, raw_text in enumerate(raw_txts):
         cleaned = _sanitize_ocr_line(raw_text)
-        if cleaned:
-            texts.append(cleaned)
-            box = raw_boxes[idx] if idx < len(raw_boxes) else None
-            score = float(raw_scores[idx]) if idx < len(raw_scores) else 0.8
-            
-            norm_box = None
-            if box is not None and len(box) >= 4:
-                try:
-                    xs = [pt[0] for pt in box]
-                    ys = [pt[1] for pt in box]
-                    if crop_norm and len(crop_norm) == 4:
-                        cx0, cy0, cw0, ch0 = crop_norm
-                        norm_box = [
-                            round(cx0 + (float(min(xs)) / max(1.0, float(w))) * cw0, 4),
-                            round(cy0 + (float(min(ys)) / max(1.0, float(h))) * ch0, 4),
-                            round(cx0 + (float(max(xs)) / max(1.0, float(w))) * cw0, 4),
-                            round(cy0 + (float(max(ys)) / max(1.0, float(h))) * ch0, 4),
-                        ]
-                    else:
-                        norm_box = [
-                            round(float(min(xs)) / max(1.0, float(w)), 4),
-                            round(float(min(ys)) / max(1.0, float(h)), 4),
-                            round(float(max(xs)) / max(1.0, float(w)), 4),
-                            round(float(max(ys)) / max(1.0, float(h)), 4),
-                        ]
-                except Exception:
-                    norm_box = None
-            
-            fallback_box = (
-                [crop_norm[0], crop_norm[1], round(crop_norm[0] + crop_norm[2], 4), round(crop_norm[1] + crop_norm[3], 4)]
-                if crop_norm and len(crop_norm) == 4
-                else [0.1, 0.7, 0.9, 0.95]
-            )
-            details.append({
-                "text": cleaned,
-                "bbox": norm_box or fallback_box,
-                "confidence": round(score, 3)
-            })
+        if not cleaned:
+            continue
+        box = raw_boxes[idx] if idx < len(raw_boxes) else None
+        score = float(raw_scores[idx]) if idx < len(raw_scores) else 0.8
+        
+        bw = 0.0
+        bh = 0.0
+        if box is not None and len(box) >= 4:
+            try:
+                xs = [pt[0] for pt in box]
+                ys = [pt[1] for pt in box]
+                bw = max(xs) - min(xs)
+                bh = max(ys) - min(ys)
+                # LỌC CỘT CHỮ DỌC (Vertical text columns / News column / Vertical Watermarks):
+                if bh >= bw * 1.15 and len(cleaned) >= 2:
+                    continue
+            except Exception:
+                pass
+
+        parsed_items.append({
+            "cleaned": cleaned,
+            "box": box,
+            "score": score,
+            "bw": bw,
+            "bh": bh,
+        })
+
+    # Nếu có nhiều items và có ít nhất 1 dòng chữ phụ đề chính lớn,
+    # lọc bỏ các mẩu ký tự rác li ti ở mép ngoài (chiều cao quá bé so với dòng chính và độ dài <= 2)
+    if len(parsed_items) > 1:
+        max_bh = max(item["bh"] for item in parsed_items)
+        if max_bh >= 22:
+            parsed_items = [
+                item for item in parsed_items
+                if not (item["bh"] < max_bh * 0.45 and len(item["cleaned"]) <= 2)
+            ]
+
+    for item in parsed_items:
+        cleaned = item["cleaned"]
+        box = item["box"]
+        score = item["score"]
+
+        texts.append(cleaned)
+        norm_box = None
+        if box is not None and len(box) >= 4:
+            try:
+                xs = [pt[0] for pt in box]
+                ys = [pt[1] for pt in box]
+                if crop_norm and len(crop_norm) == 4:
+                    cx0, cy0, cw0, ch0 = crop_norm
+                    norm_box = [
+                        round(cx0 + (float(min(xs)) / max(1.0, float(w))) * cw0, 4),
+                        round(cy0 + (float(min(ys)) / max(1.0, float(h))) * ch0, 4),
+                        round(cx0 + (float(max(xs)) / max(1.0, float(w))) * cw0, 4),
+                        round(cy0 + (float(max(ys)) / max(1.0, float(h))) * ch0, 4),
+                    ]
+                else:
+                    norm_box = [
+                        round(float(min(xs)) / max(1.0, float(w)), 4),
+                        round(float(min(ys)) / max(1.0, float(h)), 4),
+                        round(float(max(xs)) / max(1.0, float(w)), 4),
+                        round(float(max(ys)) / max(1.0, float(h)), 4),
+                    ]
+            except Exception:
+                norm_box = None
+        
+        fallback_box = (
+            [crop_norm[0], crop_norm[1], round(crop_norm[0] + crop_norm[2], 4), round(crop_norm[1] + crop_norm[3], 4)]
+            if crop_norm and len(crop_norm) == 4
+            else [0.1, 0.7, 0.9, 0.95]
+        )
+        details.append({
+            "text": cleaned,
+            "bbox": norm_box or fallback_box,
+            "confidence": round(score, 3)
+        })
 
     if profiling is not None:
         profiling["postprocess"] += time.perf_counter() - postprocess_started
@@ -726,10 +861,10 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
                 fps = 2.5
             elif sampling_duration <= 360:
                 fps = 2.0
-            elif sampling_duration <= 720:
-                fps = 1.5
             else:
-                fps = 1.0
+                # Long videos used to drop to 1.0-1.5 fps, which misses short
+                # (<1s) subtitle lines.  2 fps keeps a 0.5s sampling interval.
+                fps = 2.0
             range_label = f", selected range: {sampling_duration:.0f}s" if end_seconds is not None else ""
             print(f"[OCR] Video duration: {duration:.0f}s{range_label}, auto fps: {fps}")
 
@@ -748,11 +883,16 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
     prev_hash = None
     seg_start = None
     seg_text_lines = []
+    seg_details = []
     empty_streak = 0
     ocr_count = 0
     skip_count = 0
     unchanged_skip_count = 0
     blank_skip_count = 0
+    forced_refresh_count = 0
+    prev_stroke = None
+    last_ocr_ts = float("-inf")
+    force_refresh_s = _ocr_force_refresh_seconds()
     step = max(0, int(start_seconds * fps))
     sampled_count = 0
 
@@ -761,12 +901,27 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
     total_steps = 0
     video_duration = duration
 
+    raw_skip_ranges = kwargs.get("skip_ranges") or []
+    skip_ranges = []
+    for r in raw_skip_ranges:
+        if isinstance(r, (list, tuple)) and len(r) >= 2:
+            s_val, e_val = float(r[0]), float(r[1])
+            if e_val > s_val:
+                skip_ranges.append((s_val, e_val))
+    if skip_ranges:
+        print(f"[OCR] Bỏ qua quét OCR trong các khoảng thời gian: {skip_ranges}")
+
     frame_gen = _iter_video_frames(
         video_path, fps, start_seconds=start_seconds, end_seconds=end_seconds
     )
 
+    is_cancelled_func = kwargs.get("is_cancelled_func")
+
     decode_started = time.perf_counter()
     for timestamp, img, discovered_duration, est_steps in frame_gen:
+        if is_cancelled_func and is_cancelled_func():
+            print("[OCR] Transcription cancelled by user.")
+            return []
         profiling["seek_decode"] += time.perf_counter() - decode_started
         if discovered_duration > 0:
             video_duration = discovered_duration
@@ -779,12 +934,62 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
             fallback_bbox = [crop_norm[0], crop_norm[1], round(crop_norm[0] + crop_norm[2], 4), round(crop_norm[1] + crop_norm[3], 4)]
 
         sampled_count += 1
+
+        # Nếu timestamp rơi vào khoảng thời gian bỏ qua (ví dụ đoạn tin nhắn ASR), không quét OCR
+        if any(r_s <= timestamp <= r_e for r_s, r_e in skip_ranges):
+            skip_count += 1
+            if seg_start is not None and seg_text_lines:
+                end_ts = max(seg_start + frame_interval, timestamp - frame_interval * 0.5)
+                combined = " ".join(seg_text_lines).strip()
+                if combined:
+                    seg_bbox = seg_details[0]["bbox"] if seg_details and "bbox" in seg_details[0] else fallback_bbox
+                    seg_conf = seg_details[0]["confidence"] if seg_details and "confidence" in seg_details[0] else 0.85
+                    seg_pos = "top" if (seg_bbox and (seg_bbox[1] + seg_bbox[3]) / 2.0 < 0.45) else "bottom"
+                    segments.append({
+                        "start": seg_start,
+                        "end": end_ts,
+                        "text": combined,
+                        "words": [],
+                        "bbox": seg_bbox,
+                        "position": seg_pos,
+                        "ocr_confidence": seg_conf,
+                    })
+                seg_start = None
+                seg_text_lines = []
+                seg_details = []
+                prev_texts = None
+            last_frame_texts = []
+            last_frame_details = []
+            prev_hash = None
+            prev_stroke = None
+            step += 1
+            if sampled_count % 30 == 0 or (total_steps > 0 and sampled_count >= total_steps):
+                pct = sampled_count * 100 // total_steps if total_steps > 0 else 0
+                msg = f"[OCR] Frame {sampled_count}/{total_steps} ({pct}%, OCR: {ocr_count}, skip: {skip_count})"
+                print(msg)
+                if progress_callback:
+                    try:
+                        progress_callback(sampled_count, total_steps, ocr_count, skip_count)
+                    except Exception:
+                        pass
+            decode_started = time.perf_counter()
+            continue
+
         crop_started = time.perf_counter()
         cropped = crop_subtitle_region(img, region=region)
         profiling["crop_preprocess"] += time.perf_counter() - crop_started
         change_started = time.perf_counter()
         cur_hash = _crop_hash(cropped)
-        unchanged = prev_hash is not None and _hamming_distance(cur_hash, prev_hash) < EXACT_HASH_THRESHOLD
+        cur_stroke = _stroke_hash(cropped)
+        unchanged = (
+            prev_hash is not None
+            and _hamming_distance(cur_hash, prev_hash) < EXACT_HASH_THRESHOLD
+            and _hamming_distance(cur_stroke, prev_stroke) < STROKE_HASH_THRESHOLD
+        )
+        if unchanged and force_refresh_s > 0 and (timestamp - last_ocr_ts) >= force_refresh_s:
+            # Safety net: never trust "unchanged" for too long.
+            unchanged = False
+            forced_refresh_count += 1
         profiling["change_detection"] += time.perf_counter() - change_started
 
         if unchanged:
@@ -804,10 +1009,14 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
                 last_frame_texts = []
                 last_frame_details = []
                 prev_hash = cur_hash
+                prev_stroke = cur_stroke
+                last_ocr_ts = timestamp
             else:
                 texts, details = ocr_frame(ocr_engine, cropped, profiling=profiling, return_details=True, crop_norm=crop_norm)
                 ocr_count += 1
                 prev_hash = cur_hash
+                prev_stroke = cur_stroke
+                last_ocr_ts = timestamp
                 last_frame_texts = list(texts)
                 last_frame_details = list(details)
 
@@ -832,12 +1041,14 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
                 if combined:
                     seg_bbox = seg_details[0]["bbox"] if seg_details and "bbox" in seg_details[0] else fallback_bbox
                     seg_conf = seg_details[0]["confidence"] if seg_details and "confidence" in seg_details[0] else 0.85
+                    seg_pos = "top" if (seg_bbox and (seg_bbox[1] + seg_bbox[3]) / 2.0 < 0.45) else "bottom"
                     segments.append({
                         "start": seg_start,
                         "end": end_ts,
                         "text": combined,
                         "words": [],
                         "bbox": seg_bbox,
+                        "position": seg_pos,
                         "ocr_confidence": seg_conf,
                     })
                 seg_start = None
@@ -859,17 +1070,19 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
             if combined:
                 seg_bbox = seg_details[0]["bbox"] if seg_details and "bbox" in seg_details[0] else fallback_bbox
                 seg_conf = seg_details[0]["confidence"] if seg_details and "confidence" in seg_details[0] else 0.85
+                seg_pos = "top" if (seg_bbox and (seg_bbox[1] + seg_bbox[3]) / 2.0 < 0.45) else "bottom"
                 segments.append({
                     "start": seg_start,
                     "end": end_ts,
                     "text": combined,
                     "words": [],
                     "bbox": seg_bbox,
+                    "position": seg_pos,
                     "ocr_confidence": seg_conf,
                 })
         seg_start = 0.0 if step == 1 else timestamp - frame_interval * 0.5
         seg_text_lines = texts
-        seg_details = details if 'details' in locals() and details else []
+        seg_details = list(details) if details else []
         prev_texts = texts
         profiling["temporal"] += time.perf_counter() - temporal_started
         decode_started = time.perf_counter()
@@ -885,14 +1098,16 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
             end_ts = max(seg_start + frame_interval, video_duration)
             if end_seconds is not None:
                 end_ts = min(end_ts, float(end_seconds))
-            seg_bbox = seg_details[0]["bbox"] if 'seg_details' in locals() and seg_details and "bbox" in seg_details[0] else fallback_bbox
-            seg_conf = seg_details[0]["confidence"] if 'seg_details' in locals() and seg_details and "confidence" in seg_details[0] else 0.85
+            seg_bbox = seg_details[0]["bbox"] if seg_details and "bbox" in seg_details[0] else fallback_bbox
+            seg_conf = seg_details[0]["confidence"] if seg_details and "confidence" in seg_details[0] else 0.85
+            seg_pos = "top" if (seg_bbox and (seg_bbox[1] + seg_bbox[3]) / 2.0 < 0.45) else "bottom"
             segments.append({
                 "start": seg_start,
                 "end": end_ts,
                 "text": combined,
                 "words": [],
                 "bbox": seg_bbox,
+                "position": seg_pos,
                 "ocr_confidence": seg_conf,
             })
 
@@ -929,7 +1144,8 @@ def transcribe_video_ocr(video_path, *, region="bottom", fps=None, ocr_engine=No
     print(f"Total: {time.perf_counter() - workflow_started:.2f}s")
     print(
         "Frames: "
-        f"sampled={sampled_frames}, OCR={ocr_count}, unchanged_skip={unchanged_skip_count}, blank_skip={blank_skip_count}"
+        f"sampled={sampled_frames}, OCR={ocr_count}, unchanged_skip={unchanged_skip_count}, blank_skip={blank_skip_count}, "
+        f"forced_refresh={forced_refresh_count}"
     )
     print(f"OCR inference: avg={inference_avg_ms:.0f}ms, p95={inference_p95_ms:.0f}ms")
     print(f"Frame decode/preprocess: avg={decode_preprocess_avg_ms:.0f}ms")
@@ -940,7 +1156,7 @@ def _normalize_ocr_compare_text(text: str) -> str:
     return re.sub(r"[\s\.,?!:;\"'，。？！：；…—_~`/\\[\]()（）{}]+", "", str(text or "")).strip().lower()
 
 
-def _are_ocr_texts_near_duplicate(text1: str, text2: str, min_similarity: float = 0.90) -> bool:
+def _are_ocr_texts_near_duplicate(text1: str, text2: str, min_similarity: float = 0.88) -> bool:
     t1 = _normalize_ocr_compare_text(text1)
     t2 = _normalize_ocr_compare_text(text2)
     if not t1 or not t2:
@@ -948,7 +1164,9 @@ def _are_ocr_texts_near_duplicate(text1: str, text2: str, min_similarity: float 
     if t1 == t2:
         return True
     len_diff = abs(len(t1) - len(t2))
-    if len_diff > 1:
+    if len_diff <= 2 and ((len(t1) >= 4 and t1 in t2) or (len(t2) >= 4 and t2 in t1)):
+        return True
+    if len_diff > max(2, int(max(len(t1), len(t2)) * 0.25)):
         return False
     import difflib
     return difflib.SequenceMatcher(None, t1, t2).ratio() >= min_similarity
@@ -989,3 +1207,270 @@ def unload_ocr_engine():
     with _get_lock():
         _OCR_ENGINE = None
         print("[OCR] Engine unloaded")
+
+
+def transcribe_video_dual_ocr(
+    video_path,
+    rect1=None,
+    rect2=None,
+    *,
+    fps=None,
+    ocr_engine=None,
+    start_seconds=0.0,
+    end_seconds=None,
+    progress_callback=None,
+    **kwargs,
+):
+    """Quét đồng thời 2 khung OCR độc lập (Khung 1 ở đáy & Khung 2 ở đỉnh) trên cùng video.
+
+    Gán nhãn ocr_box_index (1 hoặc 2) cho từng câu để khi xuất video làm mờ động độc lập
+    đúng lúc phụ đề xuất hiện ở từng khung.
+    """
+    if rect1 is None:
+        r1_env = os.getenv("OCR_SUBTITLE_RECT", "")
+        if r1_env:
+            try:
+                parts = [float(x) for x in r1_env.split(",")[:4]]
+                if len(parts) == 4:
+                    rect1 = tuple(parts)
+            except Exception:
+                rect1 = (0.08, 0.70, 0.84, 0.09)
+        else:
+            rect1 = (0.08, 0.70, 0.84, 0.09)
+
+    if rect2 is None:
+        r2_env = os.getenv("OCR_SUBTITLE_RECT_2", "")
+        if r2_env:
+            try:
+                parts = [float(x) for x in r2_env.split(",")[:4]]
+                if len(parts) == 4:
+                    rect2 = tuple(parts)
+            except Exception:
+                rect2 = (0.08, 0.09, 0.84, 0.085)
+        else:
+            rect2 = (0.08, 0.09, 0.84, 0.085)
+
+    if ocr_engine is None:
+        ocr_engine = _load_ocr_engine()
+
+    if fps is None:
+        configured_fps = str(os.getenv("OCR_SAMPLING_FPS", "2.5") or "2.5").strip().lower()
+        try:
+            fps = float(configured_fps)
+        except ValueError:
+            fps = 2.5
+    fps = max(0.5, min(5.0, fps or 2.5))
+    frame_interval = 1.0 / fps
+
+    state1 = {
+        "prev_hash": None,
+        "prev_stroke": None,
+        "seg_start": None,
+        "seg_texts": [],
+        "seg_details": [],
+        "empty_streak": 0,
+        "segments": [],
+        "last_texts": [],
+        "last_details": [],
+    }
+    state2 = {
+        "prev_hash": None,
+        "prev_stroke": None,
+        "seg_start": None,
+        "seg_texts": [],
+        "seg_details": [],
+        "empty_streak": 0,
+        "segments": [],
+        "last_texts": [],
+        "last_details": [],
+    }
+
+    raw_skip_ranges = kwargs.get("skip_ranges") or []
+    skip_ranges = []
+    for r in raw_skip_ranges:
+        if isinstance(r, (list, tuple)) and len(r) >= 2:
+            s_val, e_val = float(r[0]), float(r[1])
+            if e_val > s_val:
+                skip_ranges.append((s_val, e_val))
+    if skip_ranges:
+        print(f"[Dual OCR] Bỏ qua quét OCR trong các khoảng thời gian: {skip_ranges}")
+
+    frame_gen = _iter_video_frames(video_path, fps, start_seconds=start_seconds, end_seconds=end_seconds)
+    is_cancelled_func = kwargs.get("is_cancelled_func")
+    sampled_count = 0
+    total_steps = 0
+    ocr_count = 0
+    skip_count = 0
+
+    def _process_box(img_frame, rect, box_idx, state, ts):
+        nonlocal ocr_count, skip_count
+        h, w = img_frame.shape[:2]
+        rx, ry, rw, rh = rect
+        x1 = max(0, min(w - 1, int(round(rx * w))))
+        y1 = max(0, min(h - 1, int(round(ry * h))))
+        x2 = max(x1 + 1, min(w, int(round((rx + rw) * w))))
+        y2 = max(y1 + 1, min(h, int(round((ry + rh) * h))))
+        cropped = img_frame[y1:y2, x1:x2]
+        if cropped.size == 0 or cropped.shape[0] < 4 or cropped.shape[1] < 4:
+            return
+
+        cur_h = _crop_hash(cropped)
+        cur_s = _stroke_hash(cropped)
+        unchanged = (
+            state["prev_hash"] is not None
+            and _hamming_distance(cur_h, state["prev_hash"]) < EXACT_HASH_THRESHOLD
+            and _hamming_distance(cur_s, state["prev_stroke"]) < STROKE_HASH_THRESHOLD
+        )
+        if unchanged:
+            skip_count += 1
+            texts = list(state["last_texts"])
+            details = list(state["last_details"])
+        else:
+            if _is_blank_region(cropped):
+                skip_count += 1
+                texts = []
+                details = []
+            else:
+                texts, details = ocr_frame(ocr_engine, cropped, return_details=True, crop_norm=rect)
+                ocr_count += 1
+            state["prev_hash"] = cur_h
+            state["prev_stroke"] = cur_s
+            state["last_texts"] = list(texts)
+            state["last_details"] = list(details)
+
+        fallback_box = [rect[0], rect[1], round(rect[0] + rect[2], 4), round(rect[1] + rect[3], 4)]
+        if not texts:
+            state["empty_streak"] += 1
+            if state["empty_streak"] >= EMPTY_TOLERANCE and state["seg_start"] is not None:
+                end_t = max(state["seg_start"] + frame_interval, ts - frame_interval * 0.5)
+                comb = " ".join(state["seg_texts"]).strip()
+                if comb:
+                    s_bbox = state["seg_details"][0]["bbox"] if state["seg_details"] and "bbox" in state["seg_details"][0] else fallback_box
+                    s_conf = state["seg_details"][0]["confidence"] if state["seg_details"] and "confidence" in state["seg_details"][0] else 0.85
+                    state["segments"].append({
+                        "start": state["seg_start"],
+                        "end": end_t,
+                        "text": comb,
+                        "words": [],
+                        "bbox": s_bbox,
+                        "ocr_box_index": box_idx,
+                        "position": "top" if box_idx == 2 else "bottom",
+                        "ocr_confidence": s_conf,
+                    })
+                state["seg_start"] = None
+                state["seg_texts"] = []
+                state["seg_details"] = []
+        else:
+            state["empty_streak"] = 0
+            if state["seg_start"] is not None and not _texts_equal(texts, state["seg_texts"]):
+                end_t = max(state["seg_start"] + frame_interval, ts - frame_interval * 0.5)
+                comb = " ".join(state["seg_texts"]).strip()
+                if comb:
+                    s_bbox = state["seg_details"][0]["bbox"] if state["seg_details"] and "bbox" in state["seg_details"][0] else fallback_box
+                    s_conf = state["seg_details"][0]["confidence"] if state["seg_details"] and "confidence" in state["seg_details"][0] else 0.85
+                    state["segments"].append({
+                        "start": state["seg_start"],
+                        "end": end_t,
+                        "text": comb,
+                        "words": [],
+                        "bbox": s_bbox,
+                        "ocr_box_index": box_idx,
+                        "position": "top" if box_idx == 2 else "bottom",
+                        "ocr_confidence": s_conf,
+                    })
+                state["seg_start"] = None
+            if state["seg_start"] is None:
+                state["seg_start"] = max(0.0, ts - frame_interval * 0.5)
+                state["seg_texts"] = list(texts)
+                state["seg_details"] = list(details)
+
+    for timestamp, img, discovered_dur, est_steps in frame_gen:
+        if is_cancelled_func and is_cancelled_func():
+            print("[Dual OCR] Cancelled by user.")
+            return []
+        if total_steps == 0:
+            total_steps = est_steps
+            print(f"[Dual OCR] Scanning 2 boxes on ~{total_steps} frames...")
+
+        sampled_count += 1
+
+        # Nếu timestamp rơi vào khoảng thời gian bỏ qua (ví dụ đoạn tin nhắn ASR), không quét OCR
+        if any(r_s <= timestamp <= r_e for r_s, r_e in skip_ranges):
+            skip_count += 2
+            for b_idx, st, r_box in [(1, state1, rect1), (2, state2, rect2)]:
+                if st["seg_start"] is not None and st["seg_texts"]:
+                    end_t = max(st["seg_start"] + frame_interval, timestamp - frame_interval * 0.5)
+                    comb = " ".join(st["seg_texts"]).strip()
+                    if comb:
+                        fb = [r_box[0], r_box[1], round(r_box[0] + r_box[2], 4), round(r_box[1] + r_box[3], 4)]
+                        s_bbox = st["seg_details"][0]["bbox"] if st["seg_details"] and "bbox" in st["seg_details"][0] else fb
+                        s_conf = st["seg_details"][0]["confidence"] if st["seg_details"] and "confidence" in st["seg_details"][0] else 0.85
+                        st["segments"].append({
+                            "start": st["seg_start"],
+                            "end": end_t,
+                            "text": comb,
+                            "words": [],
+                            "bbox": s_bbox,
+                            "ocr_box_index": b_idx,
+                            "position": "top" if b_idx == 2 else "bottom",
+                            "ocr_confidence": s_conf,
+                        })
+                    st["seg_start"] = None
+                    st["seg_texts"] = []
+                    st["seg_details"] = []
+                st["last_texts"] = []
+                st["last_details"] = []
+                st["prev_hash"] = None
+                st["prev_stroke"] = None
+            if sampled_count % 25 == 0 or (total_steps > 0 and sampled_count >= total_steps):
+                pct = sampled_count * 100 // total_steps if total_steps > 0 else 0
+                msg = f"[Dual OCR] Frame {sampled_count}/{total_steps} ({pct}%, OCR: {ocr_count}, skip: {skip_count})"
+                print(msg)
+                if progress_callback:
+                    try:
+                        progress_callback(sampled_count, total_steps, ocr_count, skip_count)
+                    except Exception:
+                        pass
+            continue
+
+        _process_box(img, rect1, 1, state1, timestamp)
+        _process_box(img, rect2, 2, state2, timestamp)
+
+        if sampled_count % 25 == 0 or (total_steps > 0 and sampled_count >= total_steps):
+            pct = sampled_count * 100 // total_steps if total_steps > 0 else 0
+            msg = f"[Dual OCR] Frame {sampled_count}/{total_steps} ({pct}%, OCR: {ocr_count}, skip: {skip_count})"
+            print(msg)
+            if progress_callback:
+                try:
+                    progress_callback(sampled_count, total_steps, ocr_count, skip_count)
+                except Exception:
+                    pass
+
+    for b_idx, st, r_box in [(1, state1, rect1), (2, state2, rect2)]:
+        if st["seg_start"] is not None and st["seg_texts"]:
+            comb = " ".join(st["seg_texts"]).strip()
+            if comb:
+                fb = [r_box[0], r_box[1], round(r_box[0] + r_box[2], 4), round(r_box[1] + r_box[3], 4)]
+                s_bbox = st["seg_details"][0]["bbox"] if st["seg_details"] and "bbox" in st["seg_details"][0] else fb
+                s_conf = st["seg_details"][0]["confidence"] if st["seg_details"] and "confidence" in st["seg_details"][0] else 0.85
+                end_t = (sampled_count * frame_interval) if total_steps <= 0 else (total_steps * frame_interval)
+                if end_seconds is not None:
+                    end_t = min(end_t, float(end_seconds))
+                st["segments"].append({
+                    "start": st["seg_start"],
+                    "end": max(st["seg_start"] + frame_interval, end_t),
+                    "text": comb,
+                    "words": [],
+                    "bbox": s_bbox,
+                    "ocr_box_index": b_idx,
+                    "position": "top" if b_idx == 2 else "bottom",
+                    "ocr_confidence": s_conf,
+                })
+
+    adaptive_max_gap = max(0.7, frame_interval + 0.2)
+    merged1 = _merge_adjacent(state1["segments"], max_gap=adaptive_max_gap)
+    merged2 = _merge_adjacent(state2["segments"], max_gap=adaptive_max_gap)
+
+    all_segs = sorted(merged1 + merged2, key=lambda s: float(s["start"]))
+    print(f"[Dual OCR] Done: Box 1 = {len(merged1)} cues, Box 2 = {len(merged2)} cues. Total = {len(all_segs)} cues.")
+    return all_segs

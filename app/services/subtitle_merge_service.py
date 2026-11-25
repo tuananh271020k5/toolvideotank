@@ -101,6 +101,14 @@ class SubtitleMergeService:
                 continue
 
             prev = merged[-1]
+            prev_box = prev.get("ocr_box_index")
+            item_box = item.get("ocr_box_index")
+
+            # Nếu 2 câu thuộc 2 khung OCR khác nhau (Đỉnh vs Đáy), giữ độc lập hoàn toàn, không gộp hay cắt cụt thời gian
+            if prev_box is not None and item_box is not None and prev_box != item_box:
+                merged.append(item)
+                continue
+
             prev_end = float(prev.get("end", 0.0) or 0.0)
             gap = item_start - prev_end
 
@@ -112,9 +120,46 @@ class SubtitleMergeService:
                 prev["merged_from"].extend(item["merged_from"])
                 continue
 
+            if item_start < prev_end:
+                prev["end"] = max(round(float(prev.get("start", 0.0) or 0.0) + 0.05, 3), item_start)
+
             merged.append(item)
 
-        return merged
+        return cls.sanitize_cue_timings(merged)
+
+    @classmethod
+    def sanitize_cue_timings(cls, cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Đảm bảo các câu phụ đề không bị chồng lấn thời gian (overlap).
+
+        Nếu câu A kéo dài đến sau khi câu B bắt đầu (end_A > start_B),
+        rút ngắn end_A = start_B để câu thoại chuyển tiếp dứt khoát,
+        không bao giờ bị hiện 2-3 câu phụ đề đè lên nhau cùng lúc.
+        """
+        if not cues or len(cues) <= 1:
+            return [dict(c) for c in (cues or [])]
+
+        sorted_cues = sorted(cues, key=lambda c: float(c.get("start", 0.0) or 0.0))
+        cleaned: list[dict[str, Any]] = []
+        for cue in sorted_cues:
+            c = dict(cue)
+            s = round(float(c.get("start", 0.0) or 0.0), 3)
+            e = round(float(c.get("end", 0.0) or 0.0), 3)
+            if e <= s:
+                e = round(s + 0.5, 3)
+            c["start"] = s
+            c["end"] = e
+            if cleaned:
+                for prev in reversed(cleaned):
+                    prev_box = prev.get("ocr_box_index")
+                    cur_box = c.get("ocr_box_index")
+                    if prev_box is not None and cur_box is not None and prev_box != cur_box:
+                        continue
+                    if float(prev.get("end", 0.0)) > s:
+                        prev_start = float(prev.get("start", 0.0))
+                        prev["end"] = max(round(prev_start + 0.05, 3), s)
+                    break
+            cleaned.append(c)
+        return cleaned
 
     @classmethod
     def merge_incomplete_split_dialogues(
@@ -193,6 +238,16 @@ class SubtitleMergeService:
                 c_dur = round(c_e - c_s, 2)
                 n_dur = round(n_e - n_s, 2)
 
+                # 0. Ràng buộc khung OCR: Nếu 2 câu thuộc 2 khung khác nhau (Đỉnh vs Đáy), tuyệt đối không ghép
+                c_box = curr.get("ocr_box_index")
+                n_box = nxt.get("ocr_box_index")
+                if c_box is not None and n_box is not None and c_box != n_box:
+                    break
+                c_pos = curr.get("position")
+                n_pos = nxt.get("position")
+                if c_pos and n_pos and c_pos != n_pos:
+                    break
+
                 # 1. Khoảng cách thời gian liền kề: gap <= max_gap (0.35s)
                 if gap > max_gap:
                     break
@@ -267,4 +322,4 @@ class SubtitleMergeService:
             merged.append(curr)
             i += 1
 
-        return merged
+        return cls.sanitize_cue_timings(merged)

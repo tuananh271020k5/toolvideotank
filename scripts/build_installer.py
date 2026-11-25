@@ -4,7 +4,6 @@ Script tự động hóa tạo bộ cài đặt CapCap Installer bằng Inno Set
 - Kiểm tra và gọi Inno Setup Compiler (ISCC.exe)
 """
 
-import os
 import shutil
 import subprocess
 import sys

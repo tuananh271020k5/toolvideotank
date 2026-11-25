@@ -11,10 +11,8 @@ trạng thái xử lý, progress, output.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import re
 import time
 import uuid
 from dataclasses import dataclass, field

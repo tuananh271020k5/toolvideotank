@@ -6,16 +6,12 @@ except ImportError:
     from ui.main_window_parts.common_deps import *
 
 
-from typing import Any, Dict, List, Optional
 import os
-import json
 import logging
 
-from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QPixmap
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QPushButton, QSlider, QProgressBar, QLabel, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox, QTabWidget, QSplitter, QScrollArea, QFrame, QDialog,
-    QApplication, QFileDialog, QMessageBox, QWidget, QMenu
+    QFileDialog, QMessageBox
 )
 
 logger = logging.getLogger(__name__)
@@ -838,7 +834,6 @@ class LayerInspectorMixin:
         if not hasattr(self, "video_view") or not hasattr(self.video_view, "blur_overlay"):
             return
         try:
-            from app.layers.blur import BlurLayer
             regions = self.video_view.blur_overlay._regions or []
         except Exception:
             return
@@ -891,7 +886,6 @@ class LayerInspectorMixin:
         # Push the new style onto the B1 track layers (one payload
         # entry per BlurLayer).
         if hasattr(self, "timeline") and self.timeline._timeline:
-            from app.layers.blur import BlurLayer as _BL
             for tr in self.timeline._timeline.tracks:
                 if tr.name == "B1":
                     for i, l in enumerate(tr.layers):
@@ -1038,7 +1032,7 @@ class LayerInspectorMixin:
             if layer: layer.font_name = str(value); changed()
         def color_changed():
             from PySide6.QtWidgets import QColorDialog
-            from PySide6.QtGui import QAction, QColor
+            from PySide6.QtGui import QColor
             layer = selected()
             chosen = QColorDialog.getColor(QColor(getattr(layer, "font_color", "#FFFFFF")), self, "Pick text color")
             if layer and chosen.isValid():
@@ -2277,7 +2271,7 @@ class LayerInspectorMixin:
         # Color picker
         from PySide6.QtWidgets import QColorDialog
         def _on_color_clicked():
-            from PySide6.QtGui import QAction, QColor
+            from PySide6.QtGui import QColor
             layer, _ = _selected_mask_layer()
             current = QColor(str(getattr(layer, "color", "#000000")))
             chosen = QColorDialog.getColor(current, self, "Pick mask colour")

@@ -11,7 +11,6 @@ from typing import Any, Literal
 from app.models.master_dataset import MasterDataset
 from app.models.subtitle_segment import SubtitleSegment
 from app.services.voice_mapping_service import (
-    VoiceAssignment,
     VoiceMappingConfig,
     VoiceMappingService,
 )

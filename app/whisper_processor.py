@@ -5,7 +5,7 @@ import threading
 import traceback
 from pathlib import Path
 
-from runtime_paths import bin_path, models_path, workspace_root, subprocess_hidden_kwargs, subprocess_text_kwargs
+from runtime_paths import bin_path, models_path, workspace_root, subprocess_text_kwargs
 from services.resource_download_service import ResourceDownloadService
 
 
@@ -181,6 +181,19 @@ def _faster_whisper_cache_dir():
     return str(cache_dir)
 
 
+def _whisper_cpu_threads() -> int:
+    """CTranslate2 defaults to 4 CPU threads; use roughly the physical cores."""
+    raw = str(os.getenv("CAPCAP_WHISPER_CPU_THREADS", "") or "").strip()
+    if raw:
+        try:
+            return max(1, min(64, int(raw)))
+        except ValueError:
+            pass
+    logical = os.cpu_count() or 4
+    physical_guess = logical // 2 if logical >= 8 else logical
+    return max(4, min(16, physical_guess))
+
+
 def _detect_faster_whisper_runtime() -> dict:
     forced_device = str(os.environ.get("CAPCAP_WHISPER_DEVICE", "") or "").strip().lower()
     cpu_mode = os.environ.get("CAPCAP_DEVICE", "cuda").strip().lower() == "cpu"
@@ -269,6 +282,8 @@ def _load_whisper_model(model_name):
         "device": runtime["device"],
         "compute_type": runtime["compute_type"],
     }
+    if runtime["device"] == "cpu":
+        model_kwargs["cpu_threads"] = _whisper_cpu_threads()
     print(f"[Whisper] Model: {model_name}")
 
     original_name = str(model_name)
@@ -311,6 +326,7 @@ def _load_whisper_model(model_name):
                 fallback_kwargs = {
                     "device": "cpu",
                     "compute_type": "int8",
+                    "cpu_threads": _whisper_cpu_threads(),
                 }
                 if not os.path.isdir(str(model_name)):
                     fallback_kwargs["download_root"] = _faster_whisper_cache_dir()

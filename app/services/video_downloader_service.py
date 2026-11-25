@@ -1066,12 +1066,29 @@ class VideoDownloaderService:
     def quality_format(quality: str) -> str:
         """Return yt-dlp format string for the given quality label."""
         presets = {
-            "best":    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "1080p":   "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
-            "720p":    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-            "480p":    "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
+            "best":    "bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best",
+            "1080p":   "bestvideo[height<=1080][vcodec^=avc]+bestaudio/bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best",
+            "720p":    "bestvideo[height<=720][vcodec^=avc]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "480p":    "bestvideo[height<=480][vcodec^=avc]+bestaudio/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
         }
         return presets.get(quality, presets["best"])
+
+    @staticmethod
+    def _cleanup_partial_files(dir_path: str, title_hint: str = ""):
+        """Xóa các file tạm dở dang (.part, .f30080.mp4, .f30280.m4a, v.v.) tránh để lại file câm tiếng."""
+        try:
+            if not os.path.isdir(dir_path):
+                return
+            clean_hint = "".join(c for c in title_hint if c not in r'\/:*?"<>|').strip()[:25] if title_hint else ""
+            for fname in os.listdir(dir_path):
+                if fname.endswith(".part") or fname.endswith(".m4s") or re.search(r'\.f\d+\.(mp4|m4a|webm)$', fname):
+                    if not clean_hint or (clean_hint and clean_hint in fname):
+                        try:
+                            os.remove(os.path.join(dir_path, fname))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Single video download
@@ -1154,7 +1171,7 @@ class VideoDownloaderService:
 
         ydl_opts = {
             "format": self.quality_format(quality),
-            "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+            "outtmpl": os.path.join(output_dir, "%(title)s [%(id)s].%(ext)s"),
             "merge_output_format": "mp4",
             "progress_hooks": [_hook],
             "quiet": True,
@@ -1162,10 +1179,18 @@ class VideoDownloaderService:
             "noprogress": True,
             "retries": 15,
             "fragment_retries": 15,
-            "http_chunk_size": 10485760,  # 10 MB chunks avoids Akamai/Bilibili CDN stream cutoff
+            "concurrent_fragment_downloads": 4,
+            "socket_timeout": 60,
             # No watermark tricks
             "extractor_args": {"tiktok": ["app_version=0"]},
         }
+        try:
+            from app.runtime_paths import resolve_ffmpeg_path
+            ff_p = resolve_ffmpeg_path()
+            if ff_p and os.path.isfile(ff_p):
+                ydl_opts["ffmpeg_location"] = os.path.dirname(ff_p)
+        except Exception:
+            pass
 
         platform = detect_platform(url)
         if platform == "douyin":
@@ -1192,6 +1217,31 @@ class VideoDownloaderService:
             }
             if platform == "bilibili" or "bilibili.com" in url or "b23.tv" in url:
                 headers["Referer"] = "https://www.bilibili.com/"
+                # Bilibili DASH streams: Tách riêng luồng hình ảnh và âm thanh.
+                # Luôn ưu tiên video 1080p chuẩn AVC/H.264 + Best Audio để tương thích 100% với Windows Media Player, CapCut, Premiere
+                # Tránh tự động chọn HEVC (H.265) hoặc AV1 khiến Windows không đọc được hoặc mất tiếng.
+                if quality in ("best", "1080p"):
+                    ydl_opts["format"] = (
+                        "bestvideo[height<=1080][vcodec^=avc]+bestaudio/"
+                        "bestvideo[height<=1080]+bestaudio/"
+                        "bestvideo+bestaudio/"
+                        "best[height<=1080]/best"
+                    )
+                elif quality == "720p":
+                    ydl_opts["format"] = (
+                        "bestvideo[height<=720][vcodec^=avc]+bestaudio/"
+                        "bestvideo[height<=720]+bestaudio/"
+                        "bestvideo+bestaudio/"
+                        "best[height<=720]/best"
+                    )
+                elif quality == "480p":
+                    ydl_opts["format"] = (
+                        "bestvideo[height<=480][vcodec^=avc]+bestaudio/"
+                        "bestvideo[height<=480]+bestaudio/"
+                        "bestvideo+bestaudio/"
+                        "best[height<=480]/best"
+                    )
+                ydl_opts["format_sort"] = ["res:1080", "vcodec:h264", "ext:mp4", "proto:https"]
             ydl_opts["http_headers"] = headers
 
         result = {"success": False, "files": [], "error": "", "platform": platform}
@@ -1231,7 +1281,7 @@ class VideoDownloaderService:
             # -----------------------------------------------------------
             if platform == "douyin":
                 print(f"[VideoDownloader] yt-dlp failed for Douyin: {err_msg}")
-                print(f"[VideoDownloader] Falling back to browser intercept...")
+                print("[VideoDownloader] Falling back to browser intercept...")
                 if progress_callback:
                     p = DownloadProgress()
                     p.status = "downloading"
@@ -1260,6 +1310,9 @@ class VideoDownloaderService:
                     )
             else:
                 result["error"] = err_msg
+
+            # Dọn dẹp file tạm stream dở dang (tránh để lại file .f*.mp4 không có tiếng)
+            self._cleanup_partial_files(output_dir)
 
             progress.status = "error"
             progress.error = result["error"]
@@ -1311,7 +1364,7 @@ class VideoDownloaderService:
         # yt-dlp DOES NOT support Douyin user profiles and will always throw "Unsupported URL".
         # Bypass yt-dlp directly and scrape with high-speed headless browser!
         if platform == "douyin" and "/user/" in url:
-            print(f"[VideoDownloader] Direct scraping Douyin user profile...")
+            print("[VideoDownloader] Direct scraping Douyin user profile...")
             try:
                 video_links, channel_name = _scrape_douyin_user_videos(
                     url,
@@ -1466,7 +1519,7 @@ class VideoDownloaderService:
 
         dl_opts = {
             "format": self.quality_format(quality),
-            "outtmpl": os.path.join(channel_dir, "%(title)s.%(ext)s"),
+            "outtmpl": os.path.join(channel_dir, "%(title)s [%(id)s].%(ext)s"),
             "merge_output_format": "mp4",
             "progress_hooks": [_hook],
             "quiet": True,
@@ -1474,9 +1527,16 @@ class VideoDownloaderService:
             "noprogress": True,
             "retries": 15,
             "fragment_retries": 15,
-            "http_chunk_size": 10485760,  # 10 MB chunks avoids Akamai/Bilibili CDN stream cutoff
+            "socket_timeout": 60,
             "extractor_args": {"tiktok": ["app_version=0"]},
         }
+        try:
+            from app.runtime_paths import resolve_ffmpeg_path
+            ff_p = resolve_ffmpeg_path()
+            if ff_p and os.path.isfile(ff_p):
+                dl_opts["ffmpeg_location"] = os.path.dirname(ff_p)
+        except Exception:
+            pass
 
         if platform in ("tiktok", "bilibili", "youtube", "facebook", "instagram", "kuaishou"):
             from app.services.cookie_storage_service import get_saved_platform_cookies
@@ -1488,6 +1548,28 @@ class VideoDownloaderService:
             }
             if platform == "bilibili" or "bilibili.com" in url or "b23.tv" in url:
                 headers["Referer"] = "https://www.bilibili.com/"
+                if quality in ("best", "1080p"):
+                    dl_opts["format"] = (
+                        "bestvideo[height<=1080][vcodec^=avc]+bestaudio/"
+                        "bestvideo[height<=1080]+bestaudio/"
+                        "bestvideo+bestaudio/"
+                        "best[height<=1080]/best"
+                    )
+                elif quality == "720p":
+                    dl_opts["format"] = (
+                        "bestvideo[height<=720][vcodec^=avc]+bestaudio/"
+                        "bestvideo[height<=720]+bestaudio/"
+                        "bestvideo+bestaudio/"
+                        "best[height<=720]/best"
+                    )
+                elif quality == "480p":
+                    dl_opts["format"] = (
+                        "bestvideo[height<=480][vcodec^=avc]+bestaudio/"
+                        "bestvideo[height<=480]+bestaudio/"
+                        "bestvideo+bestaudio/"
+                        "best[height<=480]/best"
+                    )
+                dl_opts["format_sort"] = ["res:1080", "vcodec:h264", "ext:mp4", "proto:https"]
             dl_opts["http_headers"] = headers
 
         downloaded_count = 0

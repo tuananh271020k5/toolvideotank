@@ -10,8 +10,7 @@ from typing import Callable
 
 from PySide6.QtCore import QThread, Signal
 
-from app.models.render_job import RenderJob, TTSSegmentResult
-from app.models.subtitle_segment import SubtitleSegment
+from app.models.render_job import RenderJob
 
 
 def _get_wav_duration(wav_path: str) -> float:

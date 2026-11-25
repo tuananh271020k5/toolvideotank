@@ -13,7 +13,6 @@ import os
 import shutil
 import subprocess
 import wave
-from typing import Any
 
 from app.services.tts_backend import measure_wav_duration
 
@@ -32,9 +31,13 @@ def _resolve_ffmpeg() -> str:
     if w:
         return w
 
-    local_fallback = os.path.join(r"d:\capcap\CapCap", "bin", "ffmpeg", "ffmpeg.exe")
-    if os.path.isfile(local_fallback):
-        return local_fallback
+    try:
+        from app.runtime_paths import join_root
+        local_fallback = join_root("bin", "ffmpeg", "ffmpeg.exe")
+        if os.path.isfile(local_fallback):
+            return local_fallback
+    except Exception:
+        pass
 
     return "ffmpeg"
 

@@ -1,26 +1,22 @@
 import os
 import re
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
-    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
-    QMenu,
-    QMessageBox,
     QPushButton,
-    QProgressBar,
     QRadioButton,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
@@ -198,11 +194,11 @@ def _build_resource_media_card(gui):
     """Xây dựng thẻ Tài nguyên & Batch — Quản lý Media Pool và Xử lý hàng loạt tích hợp."""
     import os
     import time
-    from PySide6.QtCore import Qt, QTimer, QUrl
+    from PySide6.QtCore import Qt
     from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
     from PySide6.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
-        QScrollArea, QProgressBar, QSpinBox, QMenu, QInputDialog, QMessageBox,
+        QScrollArea, QMenu, QMessageBox,
     )
     from app.layers.base import LayerType
     from utils.media_utils import (
@@ -442,26 +438,37 @@ def _build_resource_media_card(gui):
         _render_media_pool()
 
     def _open_single_voice_setup_for_video(item_path):
-        from ui.dialogs.single_voice_setup_dialog import SingleVoiceSetupDialog
-        from PySide6.QtWidgets import QDialog
-        norm_p = os.path.normpath(item_path)
-        v_curr = getattr(gui, "_video_voice_configs", {}).get(norm_p, {}).get("voice_name", "")
-        init_orig = int(gui.audio_a1_volume_slider.value()) if hasattr(gui, "audio_a1_volume_slider") else 50
-        init_tts = int(gui.audio_a2_volume_slider.value()) if hasattr(gui, "audio_a2_volume_slider") else 100
-        dlg = SingleVoiceSetupDialog(
-            gui,
-            video_path=item_path,
-            blur_rect=getattr(gui, "_video_ocr_rects", {}).get(norm_p),
-            initial_orig_volume=init_orig,
-            initial_tts_volume=init_tts,
-            workspace_root=str(getattr(gui, "workspace_root", os.getcwd())),
-            initial_voice_id=v_curr or getattr(gui, "_last_single_voice_id", "adam1"),
-        )
-        if dlg.exec() == QDialog.Accepted:
+        if getattr(gui, "_single_voice_setup_active", False):
+            return
+        gui._single_voice_setup_active = True
+        try:
+            from ui.dialogs.single_voice_setup_dialog import SingleVoiceSetupDialog
+            from PySide6.QtWidgets import QDialog
+            norm_p = os.path.normpath(item_path)
+            v_curr = getattr(gui, "_video_voice_configs", {}).get(norm_p, {}).get("voice_name", "")
+            init_orig = int(gui.audio_a1_volume_slider.value()) if hasattr(gui, "audio_a1_volume_slider") else 50
+            init_tts = int(gui.audio_a2_volume_slider.value()) if hasattr(gui, "audio_a2_volume_slider") else 100
+            dlg = SingleVoiceSetupDialog(
+                gui,
+                video_path=item_path,
+                blur_rect=getattr(gui, "_video_ocr_rects", {}).get(norm_p),
+                initial_orig_volume=init_orig,
+                initial_tts_volume=init_tts,
+                workspace_root=str(getattr(gui, "workspace_root", os.getcwd())),
+                initial_voice_id=v_curr or getattr(gui, "_last_single_voice_id", "adam1"),
+            )
+            accepted = (dlg.exec() == QDialog.Accepted)
+        finally:
+            gui._single_voice_setup_active = False
+
+        if accepted:
             v_sel = dlg.get_selected_voice()
             v_short = v_sel.get("name", "").split("(")[0].replace("👩 ", "").replace("👨 ", "").replace("👑 ", "").strip()
+            if v_sel.get("id") == "no_voiceover":
+                v_short = "🚫 Chỉ Subtitle (Không voice)"
             _set_voice_for_paths([item_path], v_sel.get("id", ""), v_short)
-            gui._last_single_voice_id = v_sel.get("id", "adam1")
+            if v_sel.get("id") != "no_voiceover":
+                gui._last_single_voice_id = v_sel.get("id", "adam1")
 
             audio_mix = dlg.get_audio_mix_settings()
             if not hasattr(gui, "_video_voice_configs"):
@@ -497,6 +504,7 @@ def _build_resource_media_card(gui):
                         "burn_subs": dlg.is_burn_subtitles_enabled(),
                         "sub_cfg": dlg.get_subtitle_config(),
                         "brand_logo": dlg.get_brand_logo_settings(),
+                        "frame_border": dlg.get_frame_border_settings(),
                         "watermark": dlg.get_watermark_settings(),
                         "delogo_settings": dlg.get_delogo_settings(),
                         "use_individual_voices": False,
@@ -538,6 +546,51 @@ def _build_resource_media_card(gui):
             ps = getattr(gui, "current_project_state", None)
             if ps and hasattr(ps, "settings"):
                 ps.settings["ocr_subtitle_rect"] = f"{rect_tuple[0]:.4f},{rect_tuple[1]:.4f},{rect_tuple[2]:.4f},{rect_tuple[3]:.4f}"
+        # Lưu vào môi trường và QSettings toàn cục
+        r_str = f"{rect_tuple[0]:.4f},{rect_tuple[1]:.4f},{rect_tuple[2]:.4f},{rect_tuple[3]:.4f}"
+        os.environ["OCR_SUBTITLE_RECT"] = r_str
+        from PySide6.QtCore import QSettings
+        QSettings("TankVideo", "TankVideoStudio").setValue("default_ocr_rect", r_str)
+        from utils.media_utils import save_media_pool_state
+        save_media_pool_state(gui)
+        _render_media_pool()
+
+    def _set_delogo_for_paths(paths, rect_tuple):
+        if not hasattr(gui, "_video_delogo_rects"):
+            gui._video_delogo_rects = {}
+        for p in paths:
+            norm_p = os.path.normpath(p) if p else ""
+            if norm_p:
+                gui._video_delogo_rects[norm_p] = rect_tuple
+        cur_p = getattr(gui, "_current_video_path", "")
+        if cur_p and os.path.normpath(cur_p) in [os.path.normpath(x) for x in paths if x]:
+            overlay = getattr(gui, "delogo_region_overlay", None)
+            if overlay and hasattr(overlay, "set_norm_rect"):
+                overlay.set_norm_rect(*rect_tuple)
+        from PySide6.QtCore import QSettings
+        QSettings("TankVideo", "TankVideoStudio").setValue(
+            "delogo/default_rect", f"{rect_tuple[0]:.4f},{rect_tuple[1]:.4f},{rect_tuple[2]:.4f},{rect_tuple[3]:.4f}"
+        )
+        from utils.media_utils import save_media_pool_state
+        save_media_pool_state(gui)
+        _render_media_pool()
+
+    def _set_watermark_for_paths(paths, rect_tuple):
+        if not hasattr(gui, "_video_watermark_rects"):
+            gui._video_watermark_rects = {}
+        for p in paths:
+            norm_p = os.path.normpath(p) if p else ""
+            if norm_p:
+                gui._video_watermark_rects[norm_p] = rect_tuple
+        cur_p = getattr(gui, "_current_video_path", "")
+        if cur_p and os.path.normpath(cur_p) in [os.path.normpath(x) for x in paths if x]:
+            overlay = getattr(gui, "watermark_region_overlay", None)
+            if overlay and hasattr(overlay, "set_norm_rect"):
+                overlay.set_norm_rect(*rect_tuple)
+        from PySide6.QtCore import QSettings
+        QSettings("TankVideo", "TankVideoStudio").setValue(
+            "watermark/default_rect", f"{rect_tuple[0]:.4f},{rect_tuple[1]:.4f},{rect_tuple[2]:.4f},{rect_tuple[3]:.4f}"
+        )
         from utils.media_utils import save_media_pool_state
         save_media_pool_state(gui)
         _render_media_pool()
@@ -552,23 +605,58 @@ def _build_resource_media_card(gui):
             "QMenu { background: #161B24; color: #E5E7EB; border: 1px solid #2E384D; padding: 4px; font-size: 11px; } "
             "QMenu::item:selected { background: #FF8A00; color: #fff; }"
         )
-        act_cur = m.addAction("💾 Áp dụng khung OCR hiện tại trên màn hình")
+        act_cur_all = m.addAction("⭐ Áp dụng TẤT CẢ (Khung OCR + Xóa Logo + Watermark) trên màn hình")
+        act_cur_ocr = m.addAction("🎯 Áp dụng khung OCR hiện tại trên màn hình")
+        act_cur_delogo = m.addAction("🧹 Áp dụng khung Xóa Logo hiện tại trên màn hình")
+        act_cur_wm = m.addAction("💧 Áp dụng khung Xóa Watermark hiện tại trên màn hình")
         m.addSeparator()
-        act_b = m.addAction("👇 OCR Dưới đáy (65%)")
-        act_m = m.addAction("👉 OCR Ở giữa màn hình (40%)")
-        act_t = m.addAction("👆 OCR Trên đỉnh màn hình (10%)")
+        act_b = m.addAction("👇 OCR Dưới đáy chuẩn (80% - 95%)")
+        act_b_sat = m.addAction("👇 OCR Sát đáy màn hình (85% - 96%)")
+        act_m_bot = m.addAction("👉 OCR Ở giữa phía dưới (65% - 80%)")
+        act_m = m.addAction("👉 OCR Ở giữa màn hình (40% - 60%)")
+        act_t = m.addAction("👆 OCR Trên đỉnh màn hình (5% - 20%)")
         pos = btn_group_ocr.mapToGlobal(QPoint(0, btn_group_ocr.height()))
         chosen = m.exec(pos)
-        if chosen == act_cur:
+        if chosen == act_cur_all:
+            ov_ocr = getattr(gui, "ocr_region_overlay", None)
+            if ov_ocr and hasattr(ov_ocr, "get_norm_rect"):
+                _set_ocr_for_paths(sel, ov_ocr.get_norm_rect())
+            ov_dl = getattr(gui, "delogo_region_overlay", None)
+            if ov_dl and hasattr(ov_dl, "get_norm_rect"):
+                _set_delogo_for_paths(sel, ov_dl.get_norm_rect())
+            ov_wm = getattr(gui, "watermark_region_overlay", None)
+            if ov_wm and hasattr(ov_wm, "get_norm_rect"):
+                _set_watermark_for_paths(sel, ov_wm.get_norm_rect())
+            if hasattr(gui, "show_status_message"):
+                gui.show_status_message(f"⭐ Đã áp dụng toàn bộ Khung OCR, Xóa Logo và Watermark cho {len(sel)} video!", 3500)
+        elif chosen == act_cur_ocr:
             overlay = getattr(gui, "ocr_region_overlay", None)
             if overlay and hasattr(overlay, "get_norm_rect"):
                 _set_ocr_for_paths(sel, overlay.get_norm_rect())
+                if hasattr(gui, "show_status_message"):
+                    gui.show_status_message(f"🎯 Đã áp dụng khung OCR cho {len(sel)} video!", 3000)
+        elif chosen == act_cur_delogo:
+            overlay = getattr(gui, "delogo_region_overlay", None)
+            if overlay and hasattr(overlay, "get_norm_rect"):
+                _set_delogo_for_paths(sel, overlay.get_norm_rect())
+                if hasattr(gui, "show_status_message"):
+                    gui.show_status_message(f"🧹 Đã áp dụng khung Xóa Logo cho {len(sel)} video!", 3000)
+        elif chosen == act_cur_wm:
+            overlay = getattr(gui, "watermark_region_overlay", None)
+            if overlay and hasattr(overlay, "get_norm_rect"):
+                _set_watermark_for_paths(sel, overlay.get_norm_rect())
+                if hasattr(gui, "show_status_message"):
+                    gui.show_status_message(f"💧 Đã áp dụng khung Xóa Watermark cho {len(sel)} video!", 3000)
         elif chosen == act_b:
+            _set_ocr_for_paths(sel, (0.05, 0.80, 0.90, 0.15))
+        elif chosen == act_b_sat:
+            _set_ocr_for_paths(sel, (0.05, 0.84, 0.90, 0.12))
+        elif chosen == act_m_bot:
             _set_ocr_for_paths(sel, (0.05, 0.65, 0.90, 0.16))
         elif chosen == act_m:
-            _set_ocr_for_paths(sel, (0.05, 0.40, 0.90, 0.16))
+            _set_ocr_for_paths(sel, (0.05, 0.40, 0.90, 0.18))
         elif chosen == act_t:
-            _set_ocr_for_paths(sel, (0.05, 0.10, 0.90, 0.16))
+            _set_ocr_for_paths(sel, (0.05, 0.05, 0.90, 0.15))
 
     btn_group_ocr.clicked.connect(_on_group_ocr_click)
 
@@ -634,18 +722,24 @@ def _build_resource_media_card(gui):
             init_tts = int(gui.audio_a2_volume_slider.value()) if hasattr(gui, "audio_a2_volume_slider") else 100
             last_voice_id = getattr(gui, "_last_single_voice_id", "adam1")
 
-            dialog = SingleVoiceSetupDialog(
-                gui,
-                video_path=selected_paths[0] if selected_paths else "",
-                video_paths=selected_paths,
-                initial_orig_volume=init_orig,
-                initial_tts_volume=init_tts,
-                blur_rect=blur_rect,
-                workspace_root=str(getattr(gui, "workspace_root", os.getcwd())),
-                initial_voice_id=last_voice_id,
-            )
-            if dialog.exec() != QDialog.Accepted:
+            if getattr(gui, "_single_voice_setup_active", False):
                 return
+            gui._single_voice_setup_active = True
+            try:
+                dialog = SingleVoiceSetupDialog(
+                    gui,
+                    video_path=selected_paths[0] if selected_paths else "",
+                    video_paths=selected_paths,
+                    initial_orig_volume=init_orig,
+                    initial_tts_volume=init_tts,
+                    blur_rect=blur_rect,
+                    workspace_root=str(getattr(gui, "workspace_root", os.getcwd())),
+                    initial_voice_id=last_voice_id,
+                )
+                if dialog.exec() != QDialog.Accepted:
+                    return
+            finally:
+                gui._single_voice_setup_active = False
 
             selected_voice = dialog.get_selected_voice()
             audio_mix = dialog.get_audio_mix_settings()
@@ -653,6 +747,7 @@ def _build_resource_media_card(gui):
             burn_subs = dialog.is_burn_subtitles_enabled()
             sub_cfg = dialog.get_subtitle_config()
             brand_logo = dialog.get_brand_logo_settings()
+            frame_border = dialog.get_frame_border_settings()
             watermark = dialog.get_watermark_settings()
             delogo_settings = dialog.get_delogo_settings()
             is_individual = (selected_voice.get("id") == "keep_individual")
@@ -679,6 +774,8 @@ def _build_resource_media_card(gui):
             # 4. Cập nhật nhãn giọng đọc trên thẻ video: CHỈ CẬP NHẬT KHI KHÔNG CHỌN GIỮ GIỌNG RIÊNG
             if not is_individual:
                 v_label = selected_voice.get("name", "1 Giọng").split("(")[0].replace("👩 ", "").replace("👨 ", "").replace("👑 ", "").strip()
+                if selected_voice.get("id") == "no_voiceover":
+                    v_label = "🚫 Chỉ Subtitle (Không voice)"
                 for it in selected:
                     p = it.get("path")
                     if p:
@@ -700,6 +797,7 @@ def _build_resource_media_card(gui):
                 "burn_subs": burn_subs,
                 "sub_cfg": sub_cfg,
                 "brand_logo": brand_logo,
+                "frame_border": frame_border,
                 "watermark": watermark,
                 "delogo_settings": delogo_settings,
                 "use_individual_voices": is_individual,
@@ -955,6 +1053,8 @@ def _build_resource_media_card(gui):
                 gui.current_segments = base_segs
             if hasattr(gui, "timeline") and hasattr(gui.timeline, "set_segments"):
                 gui.timeline.set_segments(trans_segs)
+                if hasattr(gui.timeline, "fit_timeline"):
+                    gui.timeline.fit_timeline()
             if hasattr(gui, "subtitle_list_view") and hasattr(gui.subtitle_list_view, "refresh_segments"):
                 gui.subtitle_list_view.refresh_segments()
         else:
@@ -965,6 +1065,8 @@ def _build_resource_media_card(gui):
             gui.current_translated_segment_models = []
             if hasattr(gui, "timeline") and hasattr(gui.timeline, "set_segments"):
                 gui.timeline.set_segments([])
+                if hasattr(gui.timeline, "fit_timeline"):
+                    gui.timeline.fit_timeline()
             if hasattr(gui, "subtitle_list_view") and hasattr(gui.subtitle_list_view, "refresh_segments"):
                 gui.subtitle_list_view.refresh_segments()
 
@@ -1201,7 +1303,15 @@ def _build_resource_media_card(gui):
             if overlay and hasattr(overlay, "get_norm_rect"):
                 cur_ocr = overlay.get_norm_rect()
 
+        is_dual_box = bool(getattr(gui, "_video_ocr_box_modes", {}).get(norm_item, 1) == 2)
+        if not is_dual_box and is_active:
+            overlay = getattr(gui, "ocr_region_overlay", None)
+            if overlay and hasattr(overlay, "get_box_mode"):
+                is_dual_box = bool(overlay.get_box_mode() == 2)
+
         def _format_ocr_badge_info(r):
+            if is_dual_box:
+                return ("OCR: 2 Khung", "#38BDF8", "Chế độ OCR: 2 Khung (Đáy & Đỉnh)\nNhấp để đổi nhanh")
             if not r or len(r) != 4:
                 return ("OCR: Đáy (65%)", "#64748B", "Vùng nhận diện OCR: Mặc định dưới đáy\nNhấp để đổi vị trí nhanh")
             ry = r[1]
@@ -1229,23 +1339,68 @@ def _build_resource_media_card(gui):
                 "QMenu { background: #161B24; color: #E5E7EB; border: 1px solid #2E384D; padding: 4px; font-size: 11px; } "
                 "QMenu::item:selected { background: #FF8A00; color: #fff; }"
             )
-            act_save_curr = b_menu.addAction("💾 Ghi nhớ khung hiện tại cho video này")
+            act_toggle_mode = b_menu.addAction("✌ Chuyển sang 2 Khung OCR (Đáy & Đỉnh)" if not is_dual_box else "☝ Chuyển sang 1 Khung OCR (Chỉ đáy)")
             b_menu.addSeparator()
-            act_b = b_menu.addAction("👇 OCR Dưới đáy (65%)")
-            act_m = b_menu.addAction("👉 OCR Ở giữa màn hình (40%)")
-            act_t = b_menu.addAction("👆 OCR Trên đỉnh màn hình (10%)")
+            act_save_all = b_menu.addAction("⭐ Ghi nhớ TẤT CẢ (Khung OCR + Xóa Logo + Watermark)")
+            act_save_curr = b_menu.addAction("🎯 Ghi nhớ khung OCR hiện tại cho video này")
+            act_save_delogo = b_menu.addAction("🧹 Ghi nhớ khung Xóa Logo hiện tại cho video này")
+            act_save_wm = b_menu.addAction("💧 Ghi nhớ khung Xóa Watermark hiện tại cho video này")
+            b_menu.addSeparator()
+            act_b = b_menu.addAction("👇 OCR Dưới đáy chuẩn (80% - 95%)")
+            act_b_sat = b_menu.addAction("👇 OCR Sát đáy màn hình (85% - 96%)")
+            act_m_bot = b_menu.addAction("👉 OCR Giữa phía dưới (65% - 80%)")
+            act_m = b_menu.addAction("👉 OCR Giữa màn hình (40% - 60%)")
+            act_t = b_menu.addAction("👆 OCR Trên đỉnh màn hình (5% - 20%)")
             pos = ev.globalPosition().toPoint() if hasattr(ev, "globalPosition") else ev.globalPos()
             chosen = b_menu.exec(pos)
-            if chosen == act_save_curr:
+            if chosen == act_toggle_mode:
+                new_mode = 1 if is_dual_box else 2
+                if not hasattr(gui, "_video_ocr_box_modes"):
+                    gui._video_ocr_box_modes = {}
+                gui._video_ocr_box_modes[norm_item] = new_mode
+                if is_active:
+                    combo = getattr(gui, "ocr_box_mode_combo", None)
+                    if combo is not None:
+                        combo.blockSignals(True)
+                        combo.setCurrentIndex(1 if new_mode == 2 else 0)
+                        combo.blockSignals(False)
+                    ov = getattr(gui, "ocr_region_overlay", None)
+                    if ov and hasattr(ov, "set_box_mode"):
+                        ov.set_box_mode(new_mode)
+                if hasattr(gui, "_refresh_media_pool_ui") and callable(gui._refresh_media_pool_ui):
+                    gui._refresh_media_pool_ui()
+            elif chosen == act_save_all:
+                ov_ocr = getattr(gui, "ocr_region_overlay", None)
+                if ov_ocr and hasattr(ov_ocr, "get_norm_rect"):
+                    _set_ocr_for_paths([item_path], ov_ocr.get_norm_rect())
+                ov_dl = getattr(gui, "delogo_region_overlay", None)
+                if ov_dl and hasattr(ov_dl, "get_norm_rect"):
+                    _set_delogo_for_paths([item_path], ov_dl.get_norm_rect())
+                ov_wm = getattr(gui, "watermark_region_overlay", None)
+                if ov_wm and hasattr(ov_wm, "get_norm_rect"):
+                    _set_watermark_for_paths([item_path], ov_wm.get_norm_rect())
+            elif chosen == act_save_curr:
                 overlay = getattr(gui, "ocr_region_overlay", None)
                 if overlay and hasattr(overlay, "get_norm_rect"):
                     _set_ocr_for_paths([item_path], overlay.get_norm_rect())
+            elif chosen == act_save_delogo:
+                overlay = getattr(gui, "delogo_region_overlay", None)
+                if overlay and hasattr(overlay, "get_norm_rect"):
+                    _set_delogo_for_paths([item_path], overlay.get_norm_rect())
+            elif chosen == act_save_wm:
+                overlay = getattr(gui, "watermark_region_overlay", None)
+                if overlay and hasattr(overlay, "get_norm_rect"):
+                    _set_watermark_for_paths([item_path], overlay.get_norm_rect())
             elif chosen == act_b:
+                _set_ocr_for_paths([item_path], (0.05, 0.80, 0.90, 0.15))
+            elif chosen == act_b_sat:
+                _set_ocr_for_paths([item_path], (0.05, 0.84, 0.90, 0.12))
+            elif chosen == act_m_bot:
                 _set_ocr_for_paths([item_path], (0.05, 0.65, 0.90, 0.16))
             elif chosen == act_m:
-                _set_ocr_for_paths([item_path], (0.05, 0.40, 0.90, 0.16))
+                _set_ocr_for_paths([item_path], (0.05, 0.40, 0.90, 0.18))
             elif chosen == act_t:
-                _set_ocr_for_paths([item_path], (0.05, 0.10, 0.90, 0.16))
+                _set_ocr_for_paths([item_path], (0.05, 0.05, 0.90, 0.15))
 
         ocr_badge.mousePressEvent = _on_ocr_badge_click
         status_row.addWidget(ocr_badge)
@@ -1331,12 +1486,17 @@ def _build_resource_media_card(gui):
             act_set_single = voice_menu.addAction("🎙️ Lồng tiếng 1 giọng (Đơn vai)...")
             act_set_dual = voice_menu.addAction("👥 Lồng tiếng 2 giọng (Phân vai Nam/Nữ AI)...")
 
-            ocr_menu = menu.addMenu("🎯 Đặt khung OCR phụ đề")
-            act_save_curr = ocr_menu.addAction("💾 Ghi nhớ khung hiện tại cho video này")
+            ocr_menu = menu.addMenu("🎯 Đặt khung OCR & Vùng che")
+            act_save_all = ocr_menu.addAction("⭐ Ghi nhớ TẤT CẢ (Khung OCR + Xóa Logo + Watermark)")
+            act_save_curr = ocr_menu.addAction("🎯 Ghi nhớ khung OCR hiện tại cho video này")
+            act_save_delogo = ocr_menu.addAction("🧹 Ghi nhớ khung Xóa Logo hiện tại cho video này")
+            act_save_wm = ocr_menu.addAction("💧 Ghi nhớ khung Xóa Watermark hiện tại cho video này")
             ocr_menu.addSeparator()
-            act_ocr_bottom = ocr_menu.addAction("👇 Dưới đáy (65%)")
-            act_ocr_mid = ocr_menu.addAction("👉 Ở giữa màn hình (40%)")
-            act_ocr_top = ocr_menu.addAction("👆 Trên đỉnh màn hình (10%)")
+            act_ocr_bottom = ocr_menu.addAction("👇 Dưới đáy chuẩn (80% - 95%)")
+            act_ocr_sat = ocr_menu.addAction("👇 Sát đáy màn hình (85% - 96%)")
+            act_ocr_m_bot = ocr_menu.addAction("👉 Ở giữa phía dưới (65% - 80%)")
+            act_ocr_mid = ocr_menu.addAction("👉 Ở giữa màn hình (40% - 60%)")
+            act_ocr_top = ocr_menu.addAction("👆 Trên đỉnh màn hình (5% - 20%)")
 
             menu.addSeparator()
             act_open_out = None
@@ -1358,16 +1518,38 @@ def _build_resource_media_card(gui):
                 _open_single_voice_setup_for_video(item_path)
             elif action == act_set_dual:
                 _open_dual_voice_setup_for_video(item_path)
+            elif action == act_save_all:
+                ov_ocr = getattr(gui, "ocr_region_overlay", None)
+                if ov_ocr and hasattr(ov_ocr, "get_norm_rect"):
+                    _set_ocr_for_paths([item_path], ov_ocr.get_norm_rect())
+                ov_dl = getattr(gui, "delogo_region_overlay", None)
+                if ov_dl and hasattr(ov_dl, "get_norm_rect"):
+                    _set_delogo_for_paths([item_path], ov_dl.get_norm_rect())
+                ov_wm = getattr(gui, "watermark_region_overlay", None)
+                if ov_wm and hasattr(ov_wm, "get_norm_rect"):
+                    _set_watermark_for_paths([item_path], ov_wm.get_norm_rect())
             elif action == act_save_curr:
                 overlay = getattr(gui, "ocr_region_overlay", None)
                 if overlay and hasattr(overlay, "get_norm_rect"):
                     _set_ocr_for_paths([item_path], overlay.get_norm_rect())
+            elif action == act_save_delogo:
+                overlay = getattr(gui, "delogo_region_overlay", None)
+                if overlay and hasattr(overlay, "get_norm_rect"):
+                    _set_delogo_for_paths([item_path], overlay.get_norm_rect())
+            elif action == act_save_wm:
+                overlay = getattr(gui, "watermark_region_overlay", None)
+                if overlay and hasattr(overlay, "get_norm_rect"):
+                    _set_watermark_for_paths([item_path], overlay.get_norm_rect())
             elif action == act_ocr_bottom:
+                _set_ocr_for_paths([item_path], (0.05, 0.80, 0.90, 0.15))
+            elif action == act_ocr_sat:
+                _set_ocr_for_paths([item_path], (0.05, 0.84, 0.90, 0.12))
+            elif action == act_ocr_m_bot:
                 _set_ocr_for_paths([item_path], (0.05, 0.65, 0.90, 0.16))
             elif action == act_ocr_mid:
-                _set_ocr_for_paths([item_path], (0.05, 0.40, 0.90, 0.16))
+                _set_ocr_for_paths([item_path], (0.05, 0.40, 0.90, 0.18))
             elif action == act_ocr_top:
-                _set_ocr_for_paths([item_path], (0.05, 0.10, 0.90, 0.16))
+                _set_ocr_for_paths([item_path], (0.05, 0.05, 0.90, 0.15))
             elif act_open_out and action == act_open_out:
                 _open_file_folder(out_target, select_file=True)
             elif action == act_open_dir:
@@ -1919,6 +2101,111 @@ def build_start_group(gui, left_layout):
     logo_picker_row.addWidget(gui.brand_logo_preview_lbl)
     branding_main_layout.addLayout(logo_picker_row)
 
+    # Border row
+    gui.brand_frame_border_main_cb = QCheckBox("Hiển thị Khung viền video (Viền trên & Viền dưới)")
+    gui.brand_frame_border_main_cb.setStyleSheet("font-size: 11px; font-weight: 600; color: #f8fbff;")
+    branding_main_layout.addWidget(gui.brand_frame_border_main_cb)
+
+    # Border Top picker row
+    border_top_picker_row = QHBoxLayout()
+    border_top_picker_row.setSpacing(6)
+    gui.brand_frame_border_top_path_edit = QLineEdit()
+    gui.brand_frame_border_top_path_edit.setPlaceholderText("Chọn file ảnh viền trên (.png, .jpg)...")
+    gui.brand_frame_border_top_path_edit.setStyleSheet("background-color: #1a2738; color: #f8fbff; border: 1px solid #344862; border-radius: 6px; padding: 4px 6px; font-size: 11px;")
+    gui.brand_frame_border_top_browse_btn = QPushButton("Chọn ảnh trên...")
+    gui.brand_frame_border_top_browse_btn.setStyleSheet("background-color: #1e293b; color: #a78bfa; border: 1px solid #6d28d9; border-radius: 6px; padding: 4px 8px; font-size: 11px; font-weight: 600;")
+    gui.brand_frame_border_top_preview_lbl = QLabel("Trên")
+    gui.brand_frame_border_top_preview_lbl.setFixedSize(32, 32)
+    gui.brand_frame_border_top_preview_lbl.setAlignment(Qt.AlignCenter)
+    gui.brand_frame_border_top_preview_lbl.setStyleSheet("border: 1px dashed #6d28d9; border-radius: 4px; background-color: #16202e; color: #8b5cf6; font-size: 9px;")
+    border_top_picker_row.addWidget(gui.brand_frame_border_top_path_edit, 1)
+    border_top_picker_row.addWidget(gui.brand_frame_border_top_browse_btn)
+    gui.brand_frame_border_top_clear_btn = QPushButton("Xóa")
+    gui.brand_frame_border_top_clear_btn.setToolTip("Xóa ảnh viền trên (nếu chỉ muốn dùng viền dưới)")
+    gui.brand_frame_border_top_clear_btn.setStyleSheet("background-color: #1e293b; color: #f87171; border: 1px solid #7f1d1d; border-radius: 6px; padding: 4px 8px; font-size: 11px; font-weight: 600;")
+    gui.brand_frame_border_top_clear_btn.clicked.connect(lambda: (gui.brand_frame_border_top_path_edit.clear(), _sync_border_state()))
+    border_top_picker_row.addWidget(gui.brand_frame_border_top_clear_btn)
+    border_top_picker_row.addWidget(gui.brand_frame_border_top_preview_lbl)
+    branding_main_layout.addLayout(border_top_picker_row)
+
+    # Border Bottom picker row
+    border_bot_picker_row = QHBoxLayout()
+    border_bot_picker_row.setSpacing(6)
+    gui.brand_frame_border_bottom_path_edit = QLineEdit()
+    gui.brand_frame_border_bottom_path_edit.setPlaceholderText("Chọn file ảnh viền dưới (.png, .jpg)...")
+    gui.brand_frame_border_bottom_path_edit.setStyleSheet("background-color: #1a2738; color: #f8fbff; border: 1px solid #344862; border-radius: 6px; padding: 4px 6px; font-size: 11px;")
+    gui.brand_frame_border_bottom_browse_btn = QPushButton("Chọn ảnh dưới...")
+    gui.brand_frame_border_bottom_browse_btn.setStyleSheet("background-color: #1e293b; color: #a78bfa; border: 1px solid #6d28d9; border-radius: 6px; padding: 4px 8px; font-size: 11px; font-weight: 600;")
+    gui.brand_frame_border_copy_btn = QPushButton("📋 Dùng ảnh trên")
+    gui.brand_frame_border_copy_btn.setToolTip("Sao chép ảnh viền trên xuống viền dưới")
+    gui.brand_frame_border_copy_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; padding: 4px 6px; font-size: 10px; font-weight: 600;")
+    gui.brand_frame_border_bottom_preview_lbl = QLabel("Dưới")
+    gui.brand_frame_border_bottom_preview_lbl.setFixedSize(32, 32)
+    gui.brand_frame_border_bottom_preview_lbl.setAlignment(Qt.AlignCenter)
+    gui.brand_frame_border_bottom_preview_lbl.setStyleSheet("border: 1px dashed #6d28d9; border-radius: 4px; background-color: #16202e; color: #8b5cf6; font-size: 9px;")
+    border_bot_picker_row.addWidget(gui.brand_frame_border_bottom_path_edit, 1)
+    border_bot_picker_row.addWidget(gui.brand_frame_border_bottom_browse_btn)
+    border_bot_picker_row.addWidget(gui.brand_frame_border_copy_btn)
+    gui.brand_frame_border_bot_clear_btn = QPushButton("Xóa")
+    gui.brand_frame_border_bot_clear_btn.setToolTip("Xóa ảnh viền dưới (nếu chỉ muốn dùng viền trên)")
+    gui.brand_frame_border_bot_clear_btn.setStyleSheet("background-color: #1e293b; color: #f87171; border: 1px solid #7f1d1d; border-radius: 6px; padding: 4px 8px; font-size: 11px; font-weight: 600;")
+    gui.brand_frame_border_bot_clear_btn.clicked.connect(lambda: (gui.brand_frame_border_bottom_path_edit.clear(), _sync_border_state()))
+    border_bot_picker_row.addWidget(gui.brand_frame_border_bot_clear_btn)
+    border_bot_picker_row.addWidget(gui.brand_frame_border_bottom_preview_lbl)
+    branding_main_layout.addLayout(border_bot_picker_row)
+
+    # Border Heights row
+    border_height_row = QHBoxLayout()
+    border_height_row.setSpacing(6)
+    lbl_b_top_h = QLabel("Độ dày trên:")
+    lbl_b_top_h.setStyleSheet("color: #94a3b8; font-size: 11px;")
+    gui.brand_frame_border_top_height_spin = QSpinBox()
+    gui.brand_frame_border_top_height_spin.setRange(0, 400)
+    gui.brand_frame_border_top_height_spin.setSingleStep(10)
+    gui.brand_frame_border_top_height_spin.setValue(0)
+    gui.brand_frame_border_top_height_spin.setSpecialValueText("Tự động")
+    gui.brand_frame_border_top_height_spin.setSuffix(" px")
+    gui.brand_frame_border_top_height_spin.setStyleSheet("background-color: #1a2738; color: #a78bfa; border: 1px solid #6d28d9; border-radius: 4px; padding: 2px 4px; font-size: 10px; font-weight: bold;")
+
+    lbl_b_bot_h = QLabel("Độ dày dưới:")
+    lbl_b_bot_h.setStyleSheet("color: #94a3b8; font-size: 11px;")
+    gui.brand_frame_border_bot_height_spin = QSpinBox()
+    gui.brand_frame_border_bot_height_spin.setRange(0, 400)
+    gui.brand_frame_border_bot_height_spin.setSingleStep(10)
+    gui.brand_frame_border_bot_height_spin.setValue(0)
+    gui.brand_frame_border_bot_height_spin.setSpecialValueText("Tự động")
+    gui.brand_frame_border_bot_height_spin.setSuffix(" px")
+    gui.brand_frame_border_bot_height_spin.setStyleSheet("background-color: #1a2738; color: #a78bfa; border: 1px solid #6d28d9; border-radius: 4px; padding: 2px 4px; font-size: 10px; font-weight: bold;")
+
+    border_height_row.addWidget(lbl_b_top_h)
+    border_height_row.addWidget(gui.brand_frame_border_top_height_spin)
+    border_height_row.addSpacing(10)
+    border_height_row.addWidget(lbl_b_bot_h)
+    border_height_row.addWidget(gui.brand_frame_border_bot_height_spin)
+    border_height_row.addStretch()
+    branding_main_layout.addLayout(border_height_row)
+
+    # Video Zoom row (CapCut style)
+    zoom_row = QHBoxLayout()
+    zoom_row.setSpacing(8)
+    lbl_zoom_title = QLabel("🔍 Zoom video (CapCut):")
+    lbl_zoom_title.setStyleSheet("color: #38bdf8; font-weight: 600; font-size: 11px;")
+    gui.brand_video_zoom_slider = QSlider(Qt.Horizontal)
+    gui.brand_video_zoom_slider.setRange(100, 150)
+    gui.brand_video_zoom_slider.setValue(100)
+    gui.brand_video_zoom_val_lbl = QLabel("100% (Gốc)")
+    gui.brand_video_zoom_val_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px; min-width: 80px;")
+    gui.brand_video_zoom_reset_btn = QPushButton("↺ 100%")
+    gui.brand_video_zoom_reset_btn.setToolTip("Khôi phục tỷ lệ gốc 100%")
+    gui.brand_video_zoom_reset_btn.setStyleSheet("background-color: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600;")
+    gui.brand_video_zoom_reset_btn.clicked.connect(lambda: gui.brand_video_zoom_slider.setValue(100))
+
+    zoom_row.addWidget(lbl_zoom_title)
+    zoom_row.addWidget(gui.brand_video_zoom_slider, 1)
+    zoom_row.addWidget(gui.brand_video_zoom_val_lbl)
+    zoom_row.addWidget(gui.brand_video_zoom_reset_btn)
+    branding_main_layout.addLayout(zoom_row)
+
     # Watermark row
     gui.brand_wm_main_cb = QCheckBox("Hiển thị Watermark chữ (Chống reup)")
     gui.brand_wm_main_cb.setStyleSheet("font-size: 11px; font-weight: 600; color: #f8fbff;")
@@ -1935,6 +2222,27 @@ def build_start_group(gui, left_layout):
     init_logo_path = settings.value("branding/logo_path", "", type=str)
     if init_logo_path:
         gui.brand_logo_path_edit.setText(init_logo_path)
+    gui.brand_frame_border_main_cb.setChecked(settings.value("branding/enable_frame_border", False, type=bool))
+    init_border_top = settings.value("branding/frame_border_top_path", "", type=str)
+    init_border_bot = settings.value("branding/frame_border_bottom_path", "", type=str)
+    init_border_legacy = settings.value("branding/frame_border_path", "", type=str)
+    if not init_border_top and init_border_legacy:
+        init_border_top = init_border_legacy
+    if init_border_top:
+        gui.brand_frame_border_top_path_edit.setText(init_border_top)
+    if init_border_bot:
+        gui.brand_frame_border_bottom_path_edit.setText(init_border_bot)
+    gui.brand_frame_border_top_height_spin.setValue(settings.value("branding/frame_border_top_height", 0, type=int))
+    gui.brand_frame_border_bot_height_spin.setValue(settings.value("branding/frame_border_bottom_height", 0, type=int))
+    init_zoom = settings.value("branding/video_scale_percent", 100, type=int)
+    gui.brand_video_zoom_slider.setValue(max(100, min(150, init_zoom)))
+    if init_zoom == 100:
+        gui.brand_video_zoom_val_lbl.setText("100% (Gốc)")
+    elif 110 <= init_zoom <= 120:
+        gui.brand_video_zoom_val_lbl.setText(f"{init_zoom}% (Gợi ý)")
+    else:
+        gui.brand_video_zoom_val_lbl.setText(f"{init_zoom}%")
+
     gui.brand_wm_main_cb.setChecked(settings.value("branding/enable_watermark", False, type=bool))
     init_wm_text = settings.value("branding/watermark_text", "", type=str)
     if init_wm_text:
@@ -1966,16 +2274,99 @@ def build_start_group(gui, left_layout):
         gui.brand_logo_preview_lbl.clear()
         gui.brand_logo_preview_lbl.setText("Logo")
 
+    def _on_browse_frame_border_top():
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            gui,
+            "Chọn file ảnh Viền Trên Video",
+            os.path.dirname(gui.brand_frame_border_top_path_edit.text().strip()) if gui.brand_frame_border_top_path_edit.text().strip() else "",
+            "File hình ảnh (*.png *.jpg *.jpeg *.webp *.bmp);;Tất cả file (*.*)",
+        )
+        if path:
+            gui.brand_frame_border_top_path_edit.setText(os.path.normpath(path))
+            gui.brand_frame_border_main_cb.setChecked(True)
+
+    def _on_browse_frame_border_bot():
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            gui,
+            "Chọn file ảnh Viền Dưới Video",
+            os.path.dirname(gui.brand_frame_border_bottom_path_edit.text().strip()) if gui.brand_frame_border_bottom_path_edit.text().strip() else "",
+            "File hình ảnh (*.png *.jpg *.jpeg *.webp *.bmp);;Tất cả file (*.*)",
+        )
+        if path:
+            gui.brand_frame_border_bottom_path_edit.setText(os.path.normpath(path))
+            gui.brand_frame_border_main_cb.setChecked(True)
+
+    def _copy_top_border_to_bot():
+        tp = gui.brand_frame_border_top_path_edit.text().strip()
+        if tp:
+            gui.brand_frame_border_bottom_path_edit.setText(tp)
+
+    def _sync_border_state():
+        settings.setValue("branding/enable_frame_border", gui.brand_frame_border_main_cb.isChecked())
+        settings.setValue("branding/frame_border_top_path", gui.brand_frame_border_top_path_edit.text().strip())
+        settings.setValue("branding/frame_border_bottom_path", gui.brand_frame_border_bottom_path_edit.text().strip())
+        settings.setValue("branding/frame_border_path", gui.brand_frame_border_top_path_edit.text().strip() or gui.brand_frame_border_bottom_path_edit.text().strip())
+        settings.setValue("branding/frame_border_top_height", gui.brand_frame_border_top_height_spin.value())
+        settings.setValue("branding/frame_border_bottom_height", gui.brand_frame_border_bot_height_spin.value())
+
+        from PySide6.QtGui import QPixmap
+        top_p = gui.brand_frame_border_top_path_edit.text().strip()
+        if top_p and os.path.isfile(top_p):
+            pm = QPixmap(top_p)
+            if not pm.isNull():
+                gui.brand_frame_border_top_preview_lbl.setPixmap(pm.scaled(30, 30, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                gui.brand_frame_border_top_preview_lbl.setText("")
+            else:
+                gui.brand_frame_border_top_preview_lbl.clear()
+                gui.brand_frame_border_top_preview_lbl.setText("Trên")
+        else:
+            gui.brand_frame_border_top_preview_lbl.clear()
+            gui.brand_frame_border_top_preview_lbl.setText("Trên")
+
+        bot_p = gui.brand_frame_border_bottom_path_edit.text().strip()
+        if bot_p and os.path.isfile(bot_p):
+            pm = QPixmap(bot_p)
+            if not pm.isNull():
+                gui.brand_frame_border_bottom_preview_lbl.setPixmap(pm.scaled(30, 30, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                gui.brand_frame_border_bottom_preview_lbl.setText("")
+            else:
+                gui.brand_frame_border_bottom_preview_lbl.clear()
+                gui.brand_frame_border_bottom_preview_lbl.setText("Dưới")
+        else:
+            gui.brand_frame_border_bottom_preview_lbl.clear()
+            gui.brand_frame_border_bottom_preview_lbl.setText("Dưới")
+
     def _sync_wm_state():
         settings.setValue("branding/enable_watermark", gui.brand_wm_main_cb.isChecked())
         settings.setValue("branding/watermark_text", gui.brand_wm_text_edit.text().strip())
 
+    def _on_zoom_slider_changed(val: int):
+        if val == 100:
+            gui.brand_video_zoom_val_lbl.setText("100% (Gốc)")
+        elif 110 <= val <= 120:
+            gui.brand_video_zoom_val_lbl.setText(f"{val}% (Gợi ý)")
+        else:
+            gui.brand_video_zoom_val_lbl.setText(f"{val}%")
+        settings.setValue("branding/video_scale_percent", val)
+
     gui.brand_logo_browse_btn.clicked.connect(_on_browse_logo)
     gui.brand_logo_main_cb.toggled.connect(lambda: _sync_logo_state())
     gui.brand_logo_path_edit.textChanged.connect(lambda: _sync_logo_state())
+    gui.brand_frame_border_top_browse_btn.clicked.connect(_on_browse_frame_border_top)
+    gui.brand_frame_border_bottom_browse_btn.clicked.connect(_on_browse_frame_border_bot)
+    gui.brand_frame_border_copy_btn.clicked.connect(_copy_top_border_to_bot)
+    gui.brand_frame_border_main_cb.toggled.connect(lambda: _sync_border_state())
+    gui.brand_frame_border_top_path_edit.textChanged.connect(lambda: _sync_border_state())
+    gui.brand_frame_border_bottom_path_edit.textChanged.connect(lambda: _sync_border_state())
+    gui.brand_frame_border_top_height_spin.valueChanged.connect(lambda: _sync_border_state())
+    gui.brand_frame_border_bot_height_spin.valueChanged.connect(lambda: _sync_border_state())
+    gui.brand_video_zoom_slider.valueChanged.connect(_on_zoom_slider_changed)
     gui.brand_wm_main_cb.toggled.connect(lambda: _sync_wm_state())
     gui.brand_wm_text_edit.textChanged.connect(lambda: _sync_wm_state())
     _sync_logo_state()
+    _sync_border_state()
 
     media_layout.addWidget(branding_main_card)
 
@@ -2038,6 +2429,12 @@ def build_start_group(gui, left_layout):
     gui.voice_timing_sync_combo = QComboBox()
     gui.voice_timing_sync_combo.addItems(["Tắt", "Thông minh", "Ưu tiên Timeline", "Ép khớp thời gian"])
     gui.voice_timing_sync_combo.setCurrentText("Thông minh")
+    gui.voice_timing_sync_combo.setToolTip(
+        "Thông minh: co giãn tốc độ từng câu cho vừa khung giọng gốc "
+        "(nhanh tối đa 1.35x, chậm tối đa 0.9x), giữ nhịp đều giữa các câu.\n"
+        "Ưu tiên Timeline: cắt giọng đọc theo khung phụ đề.\n"
+        "Ép khớp thời gian: tăng tốc để vừa khung."
+    )
 
     def _sync_voice_speed_enabled(_value: str = ""):
         mode = gui.voice_timing_sync_combo.currentText().strip().lower()

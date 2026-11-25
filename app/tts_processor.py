@@ -165,15 +165,10 @@ def _append_local_piper_manifest_voices(catalog: dict) -> dict:
         for item in voices
         if isinstance(item, dict) and str(item.get("id", "")).strip()
     }
-    manifest_path = models_path("piper", "voices.json")
-    if not os.path.isfile(manifest_path):
-        return catalog
-    try:
-        with open(manifest_path, "r", encoding="utf-8-sig") as handle:
-            manifest = json.load(handle)
-    except Exception:
-        return catalog
-    if not isinstance(manifest, list):
+    from runtime_paths import load_piper_voice_manifest
+
+    manifest = load_piper_voice_manifest("piper")
+    if not manifest:
         return catalog
     for item in manifest:
         if not isinstance(item, dict):
@@ -373,42 +368,6 @@ def normalize_text_for_tts(
         return value
 
 
-def _subprocess_run_kwargs() -> dict:
-    kwargs = {}
-    if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        kwargs["startupinfo"] = startupinfo
-    return kwargs
-
-
-def _sanitize_filename(name: str) -> str:
-    name = re.sub(r"[^\w\-. ]+", "_", name, flags=re.UNICODE).strip()
-    return name[:120] if len(name) > 120 else name
-
-
-def _voice_provider_and_id(voice: str) -> tuple[str, str]:
-    raw = (voice or "").strip()
-    if ":" in raw:
-        provider, voice_id = raw.split(":", 1)
-        return provider.strip().lower(), voice_id.strip()
-    return "edge", raw
-
-
-def _speed_to_float(speed) -> float:
-    if isinstance(speed, (int, float)):
-        return float(speed)
-    text = str(speed or "").strip().lower().replace("x", "")
-    try:
-        return float(text or "1.0")
-    except ValueError:
-        return 1.0
-
-
-
-
-
 def piper_tts_to_wav_16k_mono(
     *,
     text: str,
@@ -516,7 +475,7 @@ def edge_tts_to_wav_16k_mono(
         "-i",
         mp3_path,
         "-ar",
-        "16000",
+        "24000",  # Edge TTS native rate; 16 kHz muffles consonants
         "-ac",
         "1",
         wav_path,
@@ -735,7 +694,7 @@ def vieneu_tts_to_wav_16k_mono(
         "-filter:a",
         f"atempo={speed_value}",
         "-ar",
-        "16000",
+        "24000",  # VieNeu native rate; 16 kHz muffles consonants
         "-ac",
         "1",
         wav_path,

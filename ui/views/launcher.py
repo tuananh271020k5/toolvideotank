@@ -4,8 +4,8 @@ import os
 import json
 import time
 import shutil
-import hashlib
 import re
+from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from runtime_paths import asset_path, subprocess_hidden_kwargs, workspace_root
+from runtime_paths import subprocess_hidden_kwargs, workspace_root
 
 
 
@@ -825,7 +825,7 @@ class LauncherWindow(QDialog):
         self.resource_btn.clicked.connect(self._on_manage_resources)
         toolbar_grid.addWidget(self.resource_btn, 1, 0)
 
-        self.split_btn = QPushButton("✂️ Cắt chia video")
+        self.split_btn = QPushButton("✂️ Cắt & Chia video")
         self.split_btn.setMinimumHeight(38)
         self.split_btn.setStyleSheet("""
             QPushButton {
@@ -834,7 +834,7 @@ class LauncherWindow(QDialog):
             }
             QPushButton:hover { background: #334155; color: #f8fafc; }
         """)
-        self.split_btn.setToolTip("Cắt video dài thành từng đoạn nhỏ dưới 2 giờ")
+        self.split_btn.setToolTip("Cắt video ngắn (Shorts / TikTok / Reels) hoặc chia nhỏ video bất kỳ")
         self.split_btn.clicked.connect(self._on_split_video)
         toolbar_grid.addWidget(self.split_btn, 1, 1)
 
@@ -1469,78 +1469,14 @@ class LauncherWindow(QDialog):
             message.setStyleSheet(MSG_STYLE)
             message.exec()
 
-    def _on_split_video(self):
-        from PySide6.QtWidgets import QMessageBox, QProgressDialog, QInputDialog
-        from PySide6.QtCore import QThread, Signal
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn video dài cần cắt chia", "",
-            "Tệp video (*.mp4 *.mkv *.avi *.mov *.webm);;Tất cả tệp (*)"
-        )
-        if not path:
-            return
-
-        duration = _get_video_duration(path)
-        if duration <= 7200:
-            mb = QMessageBox(QMessageBox.Information, "Không cần cắt chia",
-                "Video này dưới 2 giờ. Bạn có thể mở trực tiếp bằng nút '+ Tạo dự án mới'.",
-                QMessageBox.Ok, self)
-            mb.setStyleSheet(MSG_STYLE)
-            mb.exec()
-            return
-
-        h = int(duration // 3600)
-        m = int((duration % 3600) // 60)
-
-        seg_minutes, ok = QInputDialog.getInt(
-            self, "Thời lượng mỗi đoạn",
-            f"Video dài {h} giờ {m} phút.\nBạn muốn chia thành các đoạn bao nhiêu phút?",
-            120, 10, 1440, 10,
-        )
-        if not ok:
-            return
-
-        seg_seconds = seg_minutes * 60
-        base, ext = os.path.splitext(path)
-        out_pattern = f"{base}_part%03d{ext}"
-
-        reply = QMessageBox(QMessageBox.Question, "Xác nhận cắt chia video",
-            f"Chia thành các đoạn {seg_minutes} phút bằng phương pháp sao chép luồng (không mã hóa lại, cực nhanh).\n\n"
-            f"Đầu ra: {out_pattern}\n\nTiếp tục?",
-            QMessageBox.Yes | QMessageBox.No, self)
-        reply.setStyleSheet(MSG_STYLE)
-        if reply.exec() != QMessageBox.Yes:
-            return
-
-        progress = QProgressDialog("Đang cắt chia video...", None, 0, 0, self)
-        progress.setWindowTitle("Cắt chia video")
-        progress.setModal(True)
-        progress.setCancelButton(None)
-        progress.show()
-
-        import subprocess
-        import threading
-
-        def _do_split():
-            try:
-                subprocess.run(
-                    [_ffmpeg_path(), "-y", "-i", path, "-c", "copy",
-                     "-f", "segment", "-segment_time", str(seg_seconds),
-                     "-reset_timestamps", "1", out_pattern],
-                    capture_output=True, timeout=3600, **subprocess_hidden_kwargs(),
-                )
-                progress.accept()
-            except Exception as e:
-                progress.accept()
-                print(f"[Split] Error: {e}")
-
-        threading.Thread(target=_do_split, daemon=True).start()
-        progress.exec()
-
-        mb = QMessageBox(QMessageBox.Information, "Hoàn tất",
-            f"Đã cắt video thành các đoạn {seg_minutes} phút.\nTệp được lưu cùng thư mục với video gốc.",
-            QMessageBox.Ok, self)
-        mb.setStyleSheet(MSG_STYLE)
-        mb.exec()
+    def _on_split_video(self, video_path: Optional[str] = None):
+        try:
+            from ui.dialogs.video_cutter_dialog import VideoCutterDialog
+            dlg = VideoCutterDialog(self, video_path=video_path)
+            dlg.exec()
+        except Exception as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Lỗi mở công cụ cắt video", f"Không thể mở giao diện cắt video: {exc}")
 
     def _detect_gpu_with_cuda(self):
         has_gpu = False

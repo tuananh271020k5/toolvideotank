@@ -5,19 +5,16 @@ try:
     from main_window_parts.common_deps import _default_asr_engine
 except ImportError:
     from ui.main_window_parts.common_deps import *
-    from ui.main_window_parts.common_deps import _default_asr_engine
 
 
-from typing import Any, Dict, List, Optional
 import os
-import re
 import json
 import logging
 
-from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QPushButton, QSlider, QProgressBar, QLabel, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox, QTabWidget, QSplitter, QScrollArea, QFrame, QDialog,
+    QPushButton, QLabel, QComboBox, QTextEdit, QHBoxLayout, QVBoxLayout, QFrame, QDialog,
     QApplication, QColorDialog, QFileDialog, QMessageBox, QWidget
 )
 
@@ -653,7 +650,11 @@ class OcrSubtitleMixin:
                 else 0.0
             ),
             outline_color=QColor(preset.get("outline_color", "#000000")),
-            background_box=bool(self.subtitle_background_cb.isChecked()),
+            background_box=bool(
+                self.subtitle_background_cb.isChecked()
+                or getattr(self, "enable_blur_mask", True)
+                or bool(self.current_translated_segments)
+            ),
             background_color=bg_color,
             single_line=bool(getattr(self, "subtitle_single_line_cb", None) and self.subtitle_single_line_cb.isChecked()),
             bold=bool(self.subtitle_bold_cb.isChecked()),
@@ -662,12 +663,29 @@ class OcrSubtitleMixin:
         )
         position = self.get_subtitle_position_config()
         item.set_alignment(position.get("alignment_label", "Bottom"))
+
+        cur_p = getattr(self, "_current_video_path", "")
+        norm_p = os.path.normpath(cur_p) if cur_p else ""
+        ocr_rect = getattr(self, "_video_ocr_rects", {}).get(norm_p)
+        if not ocr_rect and hasattr(self, "ocr_region_overlay"):
+            ov = getattr(self, "ocr_region_overlay", None)
+            if ov and hasattr(ov, "get_norm_rect"):
+                r_ov = ov.get_norm_rect()
+                if r_ov and len(r_ov) == 4 and r_ov[2] > 0 and r_ov[3] > 0:
+                    ocr_rect = r_ov
+
+        custom_pos_enabled = bool(position.get("custom_position_enabled", False))
+        custom_y = int(position.get("custom_position_y", 86))
+        if ocr_rect and len(ocr_rect) == 4 and ocr_rect[2] > 0 and ocr_rect[3] > 0:
+            custom_pos_enabled = True
+            custom_y = int(round((ocr_rect[1] + ocr_rect[3] / 2.0) * 100))
+
         item.set_positioning(
             x_offset=int(position.get("x_offset", 0)),
             bottom_offset=int(position.get("margin_v", 30)),
-            custom_position_enabled=bool(position.get("custom_position_enabled", False)),
+            custom_position_enabled=custom_pos_enabled,
             custom_x_percent=int(position.get("custom_position_x", 50)),
-            custom_y_percent=int(position.get("custom_position_y", 86)),
+            custom_y_percent=custom_y,
         )
         segments = self.live_preview_segments or self.get_active_segments()
         selected = int(getattr(self, "_selected_segment_index", -1))
@@ -1345,6 +1363,12 @@ class OcrSubtitleMixin:
             QMessageBox.information(self, "Cắt đoạn", "Vui lòng di chuyển kim thời gian vào bên trong đoạn video cần cắt.")
             return
 
+        index = self._find_active_segment_index(int(round(split_time * 1000.0)), segments)
+        if not (0 <= index < len(segments)):
+            index = self._get_effective_selected_segment_index()
+        if not (0 <= index < len(segments)):
+            QMessageBox.information(self, "Cắt đoạn", "Vui lòng di chuyển kim thời gian vào bên trong đoạn cần cắt.")
+            return
         target = segments[index]
         start = float(target.get("start", 0.0))
         end = float(target.get("end", 0.0))
@@ -2140,6 +2164,66 @@ class OcrSubtitleMixin:
             except Exception:
                 pass
 
+    def toggle_logo_placement_overlay(self, checked: bool = None):
+        """Bật / tắt hiển thị khung kéo chọn vị trí đặt Logo thương hiệu."""
+        if checked is None:
+            checked = not bool(getattr(self, "_logo_placement_visible", False))
+        self._logo_placement_visible = bool(checked)
+        overlay = getattr(self, "logo_placement_overlay", None)
+        btn = getattr(self, "logo_placement_btn", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(bool(checked))
+            btn.blockSignals(False)
+            if bool(checked):
+                btn.setStyleSheet("QPushButton { background: #2e1d08; border: 1px solid #f59e0b; border-radius: 4px; color: #f59e0b; font-weight: 700; font-size: 11px; padding: 0 4px; }")
+            else:
+                btn.setStyleSheet("QPushButton { color: #f59e0b; font-weight: 700; font-size: 11px; padding: 0 4px; border: none; }")
+        if overlay is not None:
+            try:
+                overlay._main_window = self
+                overlay._requested_visible = bool(checked)
+                overlay.set_editable(bool(checked))
+                if checked:
+                    overlay.sync_to_view()
+                    overlay.raise_()
+                    from PySide6.QtCore import QTimer
+                    QTimer.singleShot(0, overlay.sync_to_view)
+                else:
+                    overlay.hide()
+            except Exception:
+                pass
+
+    def toggle_watermark_placement_overlay(self, checked: bool = None):
+        """Bật / tắt hiển thị khung kéo chọn vị trí đặt chữ Watermark bản quyền."""
+        if checked is None:
+            checked = not bool(getattr(self, "_watermark_placement_visible", False))
+        self._watermark_placement_visible = bool(checked)
+        overlay = getattr(self, "watermark_placement_overlay", None)
+        btn = getattr(self, "watermark_placement_btn", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(bool(checked))
+            btn.blockSignals(False)
+            if bool(checked):
+                btn.setStyleSheet("QPushButton { background: #26113b; border: 1px solid #a855f7; border-radius: 4px; color: #c084fc; font-weight: 700; font-size: 11px; padding: 0 4px; }")
+            else:
+                btn.setStyleSheet("QPushButton { color: #c084fc; font-weight: 700; font-size: 11px; padding: 0 4px; border: none; }")
+        if overlay is not None:
+            try:
+                overlay._main_window = self
+                overlay._requested_visible = bool(checked)
+                overlay.set_editable(bool(checked))
+                if checked:
+                    overlay.sync_to_view()
+                    overlay.raise_()
+                    from PySide6.QtCore import QTimer
+                    QTimer.singleShot(0, overlay.sync_to_view)
+                else:
+                    overlay.hide()
+            except Exception:
+                pass
+
     def toggle_ocr_region_editing(self, checked: bool):
         overlay = getattr(self, "ocr_region_overlay", None)
         if overlay is None:
@@ -2663,13 +2747,16 @@ class OcrSubtitleMixin:
                             break
                 if subtitle_layer_id and str(getattr(self.timeline, "_selected_layer_id", "") or "") != subtitle_layer_id:
                     self.timeline._selected_layer_id = subtitle_layer_id
-                    self.on_timeline_layer_selected(subtitle_layer_id)
+                    if not is_playing:
+                        self.on_timeline_layer_selected(subtitle_layer_id)
+                    elif hasattr(self.timeline, "update"):
+                        self.timeline.update()
             # Keep the selected TS1 cue synchronized with the playhead during
             # review playback even when the inspector was previously focused
             # on another panel.  set_selected_segment_index() updates the
             # inspector when it is visible and remains harmless otherwise.
             if is_playing and active_index >= 0 and active_index != getattr(self, "_selected_segment_index", -1):
-                self.set_selected_segment_index(active_index, sync_ui=True)
+                self.set_selected_segment_index(active_index, sync_ui=False)
 
             if inspector_visible:
                 target_editor = None
@@ -2695,13 +2782,13 @@ class OcrSubtitleMixin:
                 else:
                     active_indices = self._find_active_segment_indices(position_ms, segments)
                     if active_indices:
-                        active_lines = [segments[i].get("text", "") for i in active_indices]
-                        if len(active_lines) == 1:
-                            self.video_view.subtitle_item.set_text(active_lines[0])
-                        else:
-                            self.video_view.subtitle_item.set_lines(active_lines)
-                        self._apply_live_subtitle_segment_color(segments[active_indices[0]])
-                        self._set_live_subtitle_effects(segments[active_indices[0]], position_ms)
+                        # Luôn hiển thị câu phụ đề mới nhất/đang phát nếu có overlap nhỏ về timing
+                        latest_idx = active_indices[-1]
+                        target_cue = segments[latest_idx]
+                        cue_text = str(target_cue.get("text", "") or "").strip()
+                        self.video_view.subtitle_item.set_text(cue_text)
+                        self._apply_live_subtitle_segment_color(target_cue)
+                        self._set_live_subtitle_effects(target_cue, position_ms)
                         if not self.video_view.subtitle_item.isVisible():
                             self.video_view.subtitle_item.show()
                     else:

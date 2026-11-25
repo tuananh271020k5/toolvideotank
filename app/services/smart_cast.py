@@ -15,7 +15,7 @@ except ImportError:
     try:
         from app.config.smart_cast_voices import get_smart_cast_voice, SMART_CAST_VOICES
     except ImportError:
-        from ..config.smart_cast_voices import get_smart_cast_voice, SMART_CAST_VOICES
+        from ..config.smart_cast_voices import get_smart_cast_voice
 
 try:
     from services.speaker_gender import detect_speaker_gender_aggregated

@@ -15,7 +15,6 @@ from typing import Any
 
 from app.models.subtitle_segment import SubtitleSegment
 from app.services.tts_backend import TTSBackend, TTSResult
-from app.services.vieneu_backend import VieNeuBackend
 from app.services.unified_tts_backend import UnifiedTTSBackend
 
 

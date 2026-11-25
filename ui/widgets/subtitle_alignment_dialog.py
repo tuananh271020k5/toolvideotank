@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtWidgets import (

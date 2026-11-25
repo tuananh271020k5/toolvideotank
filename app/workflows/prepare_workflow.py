@@ -719,6 +719,25 @@ class PrepareWorkflow:
             ocr_signature = self.project_service.build_ocr_transcription_signature(
                 video_path, region=ocr_region,
             )
+            # Dense OCR sampling (~0.2s) + ASR/VAD speech fusion.  Explicit
+            # OCR_SAMPLING_FPS still wins so power users keep their setting.
+            configured_ocr_fps = str(os.getenv("OCR_SAMPLING_FPS", "auto") or "auto").strip().lower()
+            if configured_ocr_fps in {"", "auto", "default"}:
+                try:
+                    dense_ocr_fps = float(os.getenv("OCR_FUSION_FPS", "5") or 5)
+                except ValueError:
+                    dense_ocr_fps = 5.0
+                dense_ocr_fps = max(1.0, min(10.0, dense_ocr_fps))
+            else:
+                dense_ocr_fps = None
+            speech_fusion_enabled = str(
+                os.getenv("CAPCAP_SPEECH_FUSION", "1") or "1"
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            from services.speech_subtitle_fusion import FUSION_VERSION
+            ocr_signature += (
+                f"|{FUSION_VERSION if speech_fusion_enabled else 'legacy-fusion'}"
+                f"|ocr-fps={dense_ocr_fps or configured_ocr_fps}"
+            )
             if speaker_diarization:
                 # Speaker labels are part of the cached transcript artifact.
                 # Include the diarization algorithm/configuration so clearing
@@ -786,27 +805,76 @@ class PrepareWorkflow:
                     raw_segments = [segment.to_original_subtitle_dict() for segment in segment_models]
                 print("[Prepare Workflow] Reusing cached OCR transcript. Generate did not scan the video again.")
             else:
-                raw_segments = self.engine_runtime.transcribe_video_ocr(video_path, region=ocr_region)
-                # Multimodal Fusion: Spatial/Temporal Tracking + VAD + ASR 3-State Classifier
-                try:
-                    from services.hybrid_audio_ocr_fusion import (
-                        classify_ocr_segments_multimodal,
-                        extract_audio_speech_and_asr,
-                        fill_ocr_gaps_with_speech,
-                    )
-                    speech_intervals, asr_segments = extract_audio_speech_and_asr(
-                        audio_output_path, whisper_model_name=whisper_model_name
-                    )
-                    raw_segments = classify_ocr_segments_multimodal(
-                        raw_segments, speech_intervals=speech_intervals, asr_segments=asr_segments
-                    )
-                    raw_segments = fill_ocr_gaps_with_speech(
-                        audio_output_path,
-                        raw_segments,
-                        whisper_model_name=whisper_model_name,
-                    )
-                except Exception as exc:
-                    print(f"[Prepare Workflow] Multimodal fusion skipped: {exc}")
+                speech_analysis = None
+                if speech_fusion_enabled:
+                    try:
+                        from services.speech_subtitle_fusion import start_speech_analysis
+                        # Runs VAD + Whisper in a background thread while the
+                        # OCR scan below decodes the video.
+                        speech_analysis = start_speech_analysis(
+                            audio_output_path,
+                            whisper_model_name=whisper_model_name,
+                            language=source_language,
+                        )
+                    except Exception as exc:
+                        print(f"[Prepare Workflow] Could not start background speech analysis: {exc}")
+                ocr_kwargs = {"fps": dense_ocr_fps} if dense_ocr_fps else {}
+                raw_segments = self.engine_runtime.transcribe_video_ocr(
+                    video_path, region=ocr_region, **ocr_kwargs
+                )
+                speech_fusion_done = False
+                if speech_fusion_enabled:
+                    # ASR + VAD + OCR fusion: timing follows the real voice,
+                    # OCR text is preferred, missed passages are re-scanned
+                    # or filled from ASR, and uncovered speech is audited.
+                    try:
+                        from services.hybrid_audio_ocr_fusion import classify_ocr_segments_multimodal
+                        from services.speech_subtitle_fusion import run_speech_ocr_fusion
+                        fused_segments, fusion_context = run_speech_ocr_fusion(
+                            video_path=video_path,
+                            audio_path=audio_output_path,
+                            ocr_segments=raw_segments,
+                            ocr_region=ocr_region,
+                            whisper_model_name=whisper_model_name,
+                            language=source_language,
+                            speech=speech_analysis,
+                        )
+                        if fused_segments:
+                            raw_segments = classify_ocr_segments_multimodal(
+                                fused_segments,
+                                speech_intervals=fusion_context.get("speech_intervals") or [],
+                                asr_segments=fusion_context.get("asr_segments") or [],
+                            )
+                            speech_fusion_done = True
+                        self.project_service.save_json_artifact(
+                            project_state,
+                            "speech_fusion_report",
+                            os.path.join("analysis", "speech_fusion_report.json"),
+                            fusion_context.get("report") or {},
+                        )
+                    except Exception as exc:
+                        print(f"[Prepare Workflow] Speech fusion failed, using legacy fusion: {exc}")
+                if not speech_fusion_done:
+                    # Legacy Multimodal Fusion: Spatial/Temporal Tracking + VAD + ASR 3-State Classifier
+                    try:
+                        from services.hybrid_audio_ocr_fusion import (
+                            classify_ocr_segments_multimodal,
+                            extract_audio_speech_and_asr,
+                            fill_ocr_gaps_with_speech,
+                        )
+                        speech_intervals, asr_segments = extract_audio_speech_and_asr(
+                            audio_output_path, whisper_model_name=whisper_model_name
+                        )
+                        raw_segments = classify_ocr_segments_multimodal(
+                            raw_segments, speech_intervals=speech_intervals, asr_segments=asr_segments
+                        )
+                        raw_segments = fill_ocr_gaps_with_speech(
+                            audio_output_path,
+                            raw_segments,
+                            whisper_model_name=whisper_model_name,
+                        )
+                    except Exception as exc:
+                        print(f"[Prepare Workflow] Multimodal fusion skipped: {exc}")
 
                 if not raw_segments:
                     project_state.set_step_status("transcribe", "failed")
@@ -1271,7 +1339,7 @@ class PrepareWorkflow:
                 if not raw_segments and segment_models:
                     raw_segments = [segment.to_original_subtitle_dict() for segment in segment_models]
                 if has_imported_transcript:
-                    print(f"[Prepare Workflow] Using imported transcript segments. Skipping transcription.")
+                    print("[Prepare Workflow] Using imported transcript segments. Skipping transcription.")
                 else:
                     print(f"[Prepare Workflow] Reusing cached {engine_name} transcript. Generate did not transcribe again.")
             else:

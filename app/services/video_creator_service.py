@@ -90,12 +90,25 @@ class VideoCreatorConfig:
     enable_blur_mask: bool = True
     mask_mode: str = "box"                # Kiểu mặt nạ: "blur" (Ảnh 1), "box" (Ảnh 2), "none"
     blur_rect: tuple[float, float, float, float] | None = None
+    blur_rect_2: tuple[float, float, float, float] | None = None  # Khung OCR 2 (Đỉnh)
+    dynamic_mask: bool = False            # Giải pháp 2: Mặt nạ mờ Động theo thời gian
     # Brand logo settings
     enable_brand_logo: bool = False
     brand_logo_path: str = ""
     brand_logo_position: str = "top_left"
     brand_logo_size_percent: int = 15
     brand_logo_opacity: float = 1.0
+    brand_logo_custom_rect: tuple[float, float, float, float] | None = None
+    # Frame border overlay settings (khung viền video)
+    enable_frame_border: bool = False
+    frame_border_top_path: str = ""
+    frame_border_bottom_path: str = ""
+    frame_border_path: str = ""
+    frame_border_opacity: float = 1.0
+    frame_border_top_height: int = 0      # Chiều cao viền trên (px), 0 = tự động theo tỉ lệ gốc
+    frame_border_bottom_height: int = 0   # Chiều cao viền dưới (px), 0 = tự động theo tỉ lệ gốc
+    # Tỷ lệ thu phóng video kiểu CapCut (100% - 150%, zoom từ tâm)
+    video_scale_percent: int = 100
     # Text watermark settings
     enable_watermark: bool = False
     watermark_text: str = ""
@@ -103,6 +116,7 @@ class VideoCreatorConfig:
     watermark_font_size: int = 36
     watermark_opacity: float = 0.35
     watermark_color: str = "#FFFFFF"
+    watermark_custom_rect: tuple[float, float, float, float] | None = None
     # Xóa / Tẩy Logo & Watermark video gốc (Bilibili, Douyin, Bản quyền mờ)
     delogo_bilibili: bool = False
     delogo_watermark: bool = False
@@ -843,6 +857,7 @@ class VideoCreatorService:
         sub_cfg = getattr(request.config, "subtitle_config", None)
         eff_mask_mode = getattr(sub_cfg, "mask_mode", None) or getattr(request.config, "mask_mode", "blur")
         eff_blur_rect = getattr(sub_cfg, "blur_rect", None) or getattr(request.config, "blur_rect", None)
+        eff_blur_rect_2 = getattr(sub_cfg, "blur_rect_2", None) or getattr(request.config, "blur_rect_2", None)
         eff_enable_blur = getattr(sub_cfg, "enable_blur_mask", True) and getattr(request.config, "enable_blur_mask", True)
 
         export_req = VideoExportRequest(
@@ -855,17 +870,29 @@ class VideoCreatorService:
             enable_blur_mask=eff_enable_blur,
             mask_mode=eff_mask_mode,
             blur_rect=eff_blur_rect,
+            blur_rect_2=eff_blur_rect_2,
+            dynamic_mask=getattr(request.config, "dynamic_mask", False),
             enable_brand_logo=getattr(request.config, "enable_brand_logo", False),
             brand_logo_path=getattr(request.config, "brand_logo_path", ""),
             brand_logo_position=getattr(request.config, "brand_logo_position", "top_left"),
             brand_logo_size_percent=getattr(request.config, "brand_logo_size_percent", 15),
             brand_logo_opacity=getattr(request.config, "brand_logo_opacity", 1.0),
+            brand_logo_custom_rect=getattr(request.config, "brand_logo_custom_rect", None),
+            enable_frame_border=getattr(request.config, "enable_frame_border", False),
+            frame_border_top_path=getattr(request.config, "frame_border_top_path", ""),
+            frame_border_bottom_path=getattr(request.config, "frame_border_bottom_path", ""),
+            frame_border_path=getattr(request.config, "frame_border_path", ""),
+            frame_border_opacity=getattr(request.config, "frame_border_opacity", 1.0),
+            frame_border_top_height=getattr(request.config, "frame_border_top_height", 0),
+            frame_border_bottom_height=getattr(request.config, "frame_border_bottom_height", 0),
+            video_scale_percent=getattr(request.config, "video_scale_percent", 100),
             enable_watermark=getattr(request.config, "enable_watermark", False),
             watermark_text=getattr(request.config, "watermark_text", ""),
             watermark_position=getattr(request.config, "watermark_position", "center"),
             watermark_font_size=getattr(request.config, "watermark_font_size", 36),
             watermark_opacity=getattr(request.config, "watermark_opacity", 0.35),
             watermark_color=getattr(request.config, "watermark_color", "#FFFFFF"),
+            watermark_custom_rect=getattr(request.config, "watermark_custom_rect", None),
             delogo_bilibili=getattr(request.config, "delogo_bilibili", False),
             delogo_watermark=getattr(request.config, "delogo_watermark", False),
             delogo_watermark_rect=getattr(request.config, "delogo_watermark_rect", None),
@@ -889,6 +916,7 @@ class VideoCreatorService:
                     pass
 
         export_req.progress_callback = _on_export_render_progress
+        export_req.is_cancelled_func = request.is_cancelled_func
 
         # ---------------------------------------------------------------------
         # 4. GỌI EXPORT_VIDEO VỚI EXCEPTION HANDLING TẤT ĐỊNH
@@ -1270,12 +1298,32 @@ class VideoCreatorService:
         # =====================================================================
         # KHỞI TẠO SESSION WORKSPACE
         # =====================================================================
+        is_temp_session = False
         if request.workspace_dir:
             session_dir = request.workspace_dir
         else:
-            out_dir = os.path.dirname(os.path.abspath(request.output_video_path)) or "."
-            session_dir = os.path.join(out_dir, f"session_{int(time.time() * 1000)}")
+            from app.runtime_paths import temp_path
+            session_dir = temp_path("sessions", f"session_{int(time.time() * 1000)}_{os.getpid()}")
+            is_temp_session = True
         os.makedirs(session_dir, exist_ok=True)
+
+        def _safe_cleanup_session():
+            if not is_temp_session or not session_dir or not os.path.isdir(session_dir):
+                return
+            import gc
+            gc.collect()
+            for _ in range(4):
+                try:
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                    if not os.path.exists(session_dir):
+                        break
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+
+        def _finish(res: VideoCreatorResult) -> VideoCreatorResult:
+            _safe_cleanup_session()
+            return res
 
         all_warnings: list[str] = []
 
@@ -1284,7 +1332,7 @@ class VideoCreatorService:
         # =====================================================================
         # 1.1. Checkpoint Cancellation (Pre-mapping)
         if request.is_cancelled_func and request.is_cancelled_func():
-            return VideoCreatorResult(
+            return _finish(VideoCreatorResult(
                 output_video_path="",
                 output_audio_path="",
                 session_dir=session_dir,
@@ -1292,23 +1340,23 @@ class VideoCreatorService:
                 status="cancelled",
                 cancelled_stage="mapping",
                 error="",
-            )
+            ))
 
         try:
             assignments = self._resolve_voice_assignments(request.segments, request=request)
         except Exception as exc:
-            return VideoCreatorResult(
+            return _finish(VideoCreatorResult(
                 output_video_path="",
                 output_audio_path="",
                 session_dir=session_dir,
                 total_segments=len(request.segments),
                 status="failed",
                 error=f"Voice mapping failed: {exc}",
-            )
+            ))
 
         # 1.2. Checkpoint Cancellation (Post-mapping)
         if request.is_cancelled_func and request.is_cancelled_func():
-            return VideoCreatorResult(
+            return _finish(VideoCreatorResult(
                 output_video_path="",
                 output_audio_path="",
                 session_dir=session_dir,
@@ -1316,7 +1364,7 @@ class VideoCreatorService:
                 status="cancelled",
                 cancelled_stage="mapping",
                 error="",
-            )
+            ))
 
         tts_eligible_cnt = sum(1 for a in assignments if a.is_tts_eligible)
         tts_skipped_cnt = len(assignments) - tts_eligible_cnt
@@ -1338,7 +1386,7 @@ class VideoCreatorService:
 
         if tts_error_result is not None:
             tts_error_result.warnings = list(all_warnings)
-            return tts_error_result
+            return _finish(tts_error_result)
 
         # =====================================================================
         # STAGE 3: AUDIO MIXING & DUCKING ORCHESTRATION (55% -> 75%)
@@ -1351,7 +1399,7 @@ class VideoCreatorService:
 
         if mix_error_result is not None:
             mix_error_result.warnings = list(all_warnings)
-            return mix_error_result
+            return _finish(mix_error_result)
 
         # =====================================================================
         # STAGE 4: VIDEO EXPORT ORCHESTRATION (75% -> 95%)
@@ -1365,7 +1413,7 @@ class VideoCreatorService:
 
         if export_error_result is not None:
             export_error_result.warnings = list(all_warnings)
-            return export_error_result
+            return _finish(export_error_result)
 
         # =====================================================================
         # STAGE 5: VERIFICATION & POSTFLIGHT CHECK (95% -> 100%)
@@ -1375,20 +1423,11 @@ class VideoCreatorService:
         )
         if verify_error_result is not None:
             verify_error_result.warnings = list(all_warnings)
-            return verify_error_result
+            return _finish(verify_error_result)
 
         # Thành công toàn diện toàn bộ Pipeline E2E
-        # =====================================================================
-        # CLEANUP: Xóa thư mục session tạm (audio/TTS trung gian) để tiết kiệm ổ đĩa
-        # Chỉ giữ lại file video cuối cùng trong output
-        # =====================================================================
-        try:
-            if session_dir and os.path.isdir(session_dir):
-                shutil.rmtree(session_dir, ignore_errors=True)
-        except Exception:
-            pass  # Không để lỗi cleanup ảnh hưởng kết quả
-
-        return VideoCreatorResult(
+        # Dọn dẹp an toàn session tạm (audio/TTS trung gian) để tránh rác ổ đĩa
+        return _finish(VideoCreatorResult(
             output_video_path=export_res.output_video_path if export_res else request.output_video_path,
             output_audio_path=final_audio_path,
             session_dir="",  # Đã dọn dẹp
@@ -1402,9 +1441,10 @@ class VideoCreatorService:
             subtitles_skipped_count=export_res.skipped_subtitles_count if export_res else 0,
             warnings=all_warnings,
             status="success",
-        )
+        ))
 
     execute = run
+    process = run
 
 
 

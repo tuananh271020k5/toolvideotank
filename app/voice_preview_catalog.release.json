@@ -2,6 +2,25 @@
   "schema_version": 2,
   "voices": [
     {
+      "id": "vieneu_cogai_moi",
+      "name": "Cô Gái Mới (VieNeu AI)",
+      "provider": "vieneu",
+      "provider_voice": "Cô Gái Mới",
+      "language": "vi",
+      "gender": "female",
+      "tier": "free",
+      "preview_video_url": "",
+      "preview_video_path": "",
+      "preview_audio_url": "",
+      "preview_audio_path": "assets/voices/cogai_moi.wav",
+      "enabled": true,
+      "tags": [
+        "local",
+        "vieneu",
+        "ai"
+      ]
+    },
+    {
       "id": "vi_VN-vais1000-medium",
       "name": "Vais1000 Medium (Local)",
       "provider": "piper",
@@ -29,7 +48,10 @@
       "gender": "female",
       "tier": "free",
       "enabled": true,
-      "tags": ["local", "piper"]
+      "tags": [
+        "local",
+        "piper"
+      ]
     },
     {
       "id": "en_US-arctic-medium",
@@ -40,7 +62,10 @@
       "gender": "male",
       "tier": "free",
       "enabled": true,
-      "tags": ["local", "piper"]
+      "tags": [
+        "local",
+        "piper"
+      ]
     }
   ]
 }

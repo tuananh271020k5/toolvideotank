@@ -82,6 +82,47 @@ def writable_models_path(*parts: str) -> str:
     return join_root("models", *parts)
 
 
+def load_piper_voice_manifest(folder: str = "piper") -> list[dict]:
+    """Return merged Piper voice manifest entries (writable first, then bundled).
+
+    Users who downloaded the Piper pack have their own ``models/piper/voices.json``
+    in the workspace, which used to shadow the manifest bundled with the app.
+    Voices shipped in a newer release (inside ``_internal/models/piper``) were
+    then invisible.  Merge both, de-duplicated by model filename.
+    """
+    import json
+
+    merged: list[dict] = []
+    seen: set[str] = set()
+    candidates = [
+        join_root("models", folder, "voices.json"),
+        os.path.join(bundle_root(), "models", folder, "voices.json"),
+    ]
+    visited: set[str] = set()
+    for path in candidates:
+        key = os.path.normcase(os.path.abspath(path))
+        if key in visited or not os.path.isfile(path):
+            continue
+        visited.add(key)
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+        except Exception:
+            continue
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            audio_path = str(item.get("audio_path", "") or "").replace("\\", "/").strip()
+            filename = os.path.basename(audio_path).lower()
+            if not filename or filename in seen:
+                continue
+            seen.add(filename)
+            merged.append(item)
+    return merged
+
+
 def temp_path(*parts: str) -> str:
     return join_root("temp", *parts)
 
@@ -103,22 +144,96 @@ def raw_tts_path(*parts: str) -> str:
 
 
 
-def subprocess_hidden_kwargs() -> dict:
-    """Return Windows flags that keep console child processes invisible.
+def optimize_windows_performance():
+    """Tối ưu hóa hiệu năng hệ điều hành Windows khi xử lý ngầm (Background Execution).
 
-    The GUI build has no console of its own.  Without these flags, console
+    1. Vô hiệu hóa tính năng Windows 11/10 Power Throttling (EcoQoS / Efficiency Mode),
+       ngăn hệ điều hành ép tiến trình AI (OCR, Piper TTS, VAD) chạy trên nhân E-cores
+       khi người dùng thu nhỏ cửa sổ hoặc chuyển sang ứng dụng khác.
+    2. Nâng Process Priority lên ABOVE_NORMAL_PRIORITY_CLASS (0x8000).
+    3. Cố định System Timer Resolution ở mức 1ms (thay vì 15.6ms của Windows ngầm).
+    4. Giữ hệ thống liên tục hoạt động (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED).
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+            _fields_ = [
+                ("Version", wintypes.ULONG),
+                ("ControlMask", wintypes.ULONG),
+                ("StateMask", wintypes.ULONG),
+            ]
+
+        ProcessPowerThrottling = 4
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+
+        state = PROCESS_POWER_THROTTLING_STATE()
+        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        state.ControlMask = (
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        )
+        state.StateMask = 0  # Disable execution speed and timer throttling!
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetProcessInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetProcessInformation.restype = wintypes.BOOL
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+
+        hProcess = kernel32.GetCurrentProcess()
+        kernel32.SetProcessInformation(
+            hProcess, ProcessPowerThrottling, ctypes.byref(state), ctypes.sizeof(state)
+        )
+        # ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+        kernel32.SetPriorityClass(hProcess, 0x00008000)
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+        # Set 1ms high resolution timer
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+        # ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x00000001, ES_AWAYMODE_REQUIRED = 0x00000040
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000040)
+    except Exception:
+        pass
+
+
+def subprocess_hidden_kwargs() -> dict:
+    """Return Windows flags that keep console child processes invisible and high-priority.
+
+    The GUI build has no console of its own. Without these flags, console
     programs such as FFmpeg/FFprobe create a temporary console window every
     time they start, which causes visible flashes and adds process-launch
-    overhead.  The debug console build remains unaffected.
+    overhead. We also pass ABOVE_NORMAL_PRIORITY_CLASS (0x8000) so child
+    processes (FFmpeg, workers) don't get throttled into background EcoQoS.
     """
     if os.name != "nt":
         return {}
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | 0x00008000
     return {
         "startupinfo": startupinfo,
-        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "creationflags": flags,
     }
 
 

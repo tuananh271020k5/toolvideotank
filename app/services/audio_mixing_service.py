@@ -31,9 +31,13 @@ def _resolve_ffmpeg() -> str:
     if w:
         return w
 
-    local_fallback = os.path.join(r"d:\capcap\CapCap", "bin", "ffmpeg", "ffmpeg.exe")
-    if os.path.isfile(local_fallback):
-        return local_fallback
+    try:
+        from app.runtime_paths import join_root
+        local_fallback = join_root("bin", "ffmpeg", "ffmpeg.exe")
+        if os.path.isfile(local_fallback):
+            return local_fallback
+    except Exception:
+        pass
 
     return "ffmpeg"
 
@@ -140,7 +144,6 @@ class AudioMixingService:
         Giải quyết triệt để giới hạn 32KB dòng lệnh của Windows API (WinError 206)
         khi xử lý video dài (1 tiếng, 2 tiếng...) có hàng ngàn câu thoại phụ đề.
         """
-        import math
         import wave
         import numpy as np
 
@@ -150,9 +153,10 @@ class AudioMixingService:
                 try:
                     with wave.open(b.audio_path, "rb") as test_w:
                         test_sr = test_w.getframerate()
-                        if test_sr in {16000, 22050, 24000, 44100, 48000}:
+                        if test_sr in {16000, 22050, 24000, 44100, 48000} and test_sr > target_sr:
                             target_sr = test_sr
-                            break
+                            if target_sr >= 24000:
+                                break
                 except Exception:
                     pass
 
@@ -371,8 +375,8 @@ class AudioMixingService:
             inputs = ["-i", original_audio_path, "-i", unified_tts_path]
             script_lines = [
                 f"[0:a]{vol_filter},aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[bg];",
-                f"[1:a]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[fg];",
-                f"[bg][fg]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.98[outa]"
+                "[1:a]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[fg];",
+                "[bg][fg]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.98[outa]"
             ]
         else:
             inputs = ["-i", original_audio_path]

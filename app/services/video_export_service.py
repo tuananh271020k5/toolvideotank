@@ -13,6 +13,7 @@ Implements Step 7: Subtitle Rendering & Video Export Contract v1.0:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -40,9 +41,13 @@ def _resolve_ffmpeg() -> str:
     if w:
         return w
 
-    local_fallback = os.path.join(r"d:\capcap\CapCap", "bin", "ffmpeg", "ffmpeg.exe")
-    if os.path.isfile(local_fallback):
-        return local_fallback
+    try:
+        from app.runtime_paths import join_root
+        local_fallback = join_root("bin", "ffmpeg", "ffmpeg.exe")
+        if os.path.isfile(local_fallback):
+            return local_fallback
+    except Exception:
+        pass
 
     return "ffmpeg"
 
@@ -61,9 +66,13 @@ def _resolve_ffprobe() -> str:
     if w:
         return w
 
-    local_fallback = os.path.join(r"d:\capcap\CapCap", "bin", "ffmpeg", "ffprobe.exe")
-    if os.path.isfile(local_fallback):
-        return local_fallback
+    try:
+        from app.runtime_paths import join_root
+        local_fallback = join_root("bin", "ffmpeg", "ffprobe.exe")
+        if os.path.isfile(local_fallback):
+            return local_fallback
+    except Exception:
+        pass
 
     return "ffprobe"
 
@@ -377,6 +386,31 @@ def ass_color_to_hex(ass_str: str) -> str:
     return "#FFFFFF"
 
 
+def merge_time_intervals(intervals: list[tuple[float, float]], gap: float = 0.25) -> list[tuple[float, float]]:
+    """Gộp các khoảng thời gian gần nhau (< gap giây) để tránh chớp nháy bật tắt vệt mờ."""
+    if not intervals:
+        return []
+    valid = [(max(0.0, float(s)), max(0.0, float(e))) for s, e in intervals if float(e) > float(s)]
+    if not valid:
+        return []
+    valid.sort(key=lambda x: x[0])
+    merged = [valid[0]]
+    for cur_s, cur_e in valid[1:]:
+        prev_s, prev_e = merged[-1]
+        if cur_s <= prev_e + gap:
+            merged[-1] = (prev_s, max(prev_e, cur_e))
+        else:
+            merged.append((cur_s, cur_e))
+    return merged
+
+
+def build_ffmpeg_between_expression(intervals: list[tuple[float, float]]) -> str:
+    """Tạo biểu thức enable cho FFmpeg: between(t, s1, e1)+between(t, s2, e2)..."""
+    if not intervals:
+        return ""
+    return "+".join(f"between(t,{s:.2f},{e:.2f})" for s, e in intervals)
+
+
 def generate_ass_script(
     segments: list[SubtitleSegment],
     vid_w: int,
@@ -386,7 +420,9 @@ def generate_ass_script(
     enable_mask: bool = True,
     duration: float = 0.0,
     user_rect: tuple[float, float, float, float] | None = None,
+    user_rect_2: tuple[float, float, float, float] | None = None,
     mask_mode: str | None = None,
+    dynamic_mask: bool = False,
 ) -> tuple[str, int]:
     """Sinh kịch bản ASS với kiểu dáng tùy biến: hộp nền ôm sát chữ (che video gốc) hoặc dải làm mờ ngang (Ảnh 1) và chữ rõ nét."""
     is_vertical = vid_h > vid_w
@@ -510,37 +546,75 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if cur:
             lines.append(" ".join(cur))
 
-        # Tọa độ Y riêng của từng segment
+        # Tọa độ Y riêng của từng segment: Ưu tiên neo trực tiếp theo bbox thực tế từ OCR
         seg_cy = target_cy
-        # NẾU ĐÃ CÓ user_rect (người dùng quét OCR): TUYỆT ĐỐI KHÔNG để bbox ngẫu nhiên làm lệch tâm phụ đề!
-        if not user_has_rect:
-            bbox = getattr(s, "bbox", None)
-            if bbox and len(bbox) == 4:
-                try:
-                    by1, by2 = float(bbox[1]), float(bbox[3])
-                    if 0.10 <= by1 < by2 <= 0.98 and (by2 - by1) <= 0.18:
-                        cand_cy = int(round(((by1 + by2) / 2.0) * vid_h))
-                        if target_cy is None or abs(cand_cy - target_cy) <= int(round(vid_h * 0.08)):
-                            seg_cy = cand_cy
-                except Exception:
-                    pass
+        bbox = getattr(s, "bbox", None)
+        has_valid_bbox = False
+        cand_cy = target_cy
+        if bbox and len(bbox) == 4:
+            try:
+                by1, by2 = float(bbox[1]), float(bbox[3])
+                if 0.05 <= by1 < by2 <= 0.98 and (by2 - by1) <= 0.25:
+                    cand_cy = int(round(((by1 + by2) / 2.0) * vid_h))
+                    has_valid_bbox = True
+            except Exception:
+                pass
+
+        is_top = (
+            getattr(s, "position", "") == "top"
+            or getattr(s, "ocr_box_index", 1) == 2
+            or (has_valid_bbox and cand_cy < int(round(vid_h * 0.45)))
+        )
+        user_has_rect_2 = (user_rect_2 is not None and len(user_rect_2) == 4 and user_rect_2[2] > 0 and user_rect_2[3] > 0)
+
+        if is_top:
+            if user_has_rect_2:
+                seg_cy = int(round((user_rect_2[1] + user_rect_2[3] / 2.0) * vid_h))
+            elif has_valid_bbox and cand_cy < int(round(vid_h * 0.45)):
+                seg_cy = cand_cy
+            elif dynamic_mask:
+                seg_cy = int(round(vid_h * (0.16 if is_vertical else 0.14)))
+            else:
+                seg_cy = int(round(vid_h * (0.16 if is_vertical else 0.14)))
+        else:
+            if user_has_rect:
+                seg_cy = int(round((user_rect[1] + user_rect[3] / 2.0) * vid_h))
+            elif has_valid_bbox and cand_cy >= int(round(vid_h * 0.45)):
+                seg_cy = cand_cy
+            else:
+                seg_cy = target_cy
 
         num_lines = len(lines)
         longest_line_chars = max(len(l) for l in lines)
-        # Khoảng đệm ôm sát chữ (vừa vặn, che kín video gốc, không bị to cồng kềnh)
-        pad_x = int(round(font_size * 0.55))
-        box_w = min(max_line_w, longest_line_chars * char_w + pad_x * 2)
-        line_h = int(round(font_size * 1.25))
-        pad_y = int(round(font_size * 0.28))
-        box_h = num_lines * line_h + pad_y * 2
-        # Đảm bảo chiều cao tối thiểu che kín dòng chữ gốc trên video
-        min_box_h = max(int(round(font_size * 1.45)), 48 if is_vertical else 38)
-        if user_has_rect:
-            user_h_px = int(round(user_rect[3] * vid_h))
-            min_user_box_h = int(round(user_h_px * 1.25))
-            min_box_h = max(min_box_h, min_user_box_h)
-        box_h = max(min_box_h, box_h)
-        radius = min(14, int(box_h * 0.22))
+        # Khoảng đệm ôm sát chữ vừa vặn, không bị to cồng kềnh
+        pad_x = int(round(font_size * 0.50))
+        vn_box_w = longest_line_chars * char_w + pad_x * 2
+
+        # Đo kích thước chữ Trung thực tế của câu này để hộp đen che kín nhưng ôm sát nhất
+        cn_box_w = 0
+        cn_box_h = 0
+        if bbox and len(bbox) == 4:
+            try:
+                cn_box_w = int(round((float(bbox[2]) - float(bbox[0])) * vid_w)) + pad_x * 2
+                cn_box_h = int(round((float(bbox[3]) - float(bbox[1])) * vid_h * 1.22))
+            except Exception:
+                pass
+        if not cn_box_w:
+            orig_text = str(getattr(s, "text", "") or "").strip()
+            cn_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', orig_text))
+            if cn_chars > 0:
+                cn_box_w = int(round(cn_chars * font_size * 1.05)) + pad_x * 2
+
+        box_w = min(max_line_w, max(vn_box_w, cn_box_w))
+        line_h = int(round(font_size * 1.22))
+        pad_y = int(round(font_size * 0.24))
+        base_h = num_lines * line_h + pad_y * 2
+        min_box_h = max(int(round(font_size * 1.35)), 44 if is_vertical else 36)
+        if cn_box_h > 0:
+            box_h = max(base_h, min_box_h, cn_box_h)
+        else:
+            box_h = max(base_h, min_box_h)
+        radius = min(12, int(box_h * 0.22))
 
         start_t = format_ass_time(s.start)
         end_t = format_ass_time(s.end)
@@ -560,10 +634,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if enable_watermark:
         end_time_sec = max(float(duration or 0.0), 36000.0)
         end_time_ass = format_ass_time(end_time_sec)
-        dialogue_lines.insert(
-            0,
-            f"Dialogue: 10,0:00:00.00,{end_time_ass},Watermark,,0,0,0,,{watermark_text}"
-        )
+        wm_pos = str(getattr(cfg, "watermark_position", "center") or "center").strip().lower()
+        wm_custom_rect = getattr(cfg, "watermark_custom_rect", None)
+        if (wm_pos == "custom_rect" or wm_custom_rect) and wm_custom_rect and len(wm_custom_rect) == 4:
+            wx, wy, ww, wh = wm_custom_rect
+            cx = int(round(vid_w * (wx + ww / 2.0)))
+            cy = int(round(vid_h * (wy + wh / 2.0)))
+            dialogue_lines.insert(
+                0,
+                f"Dialogue: 10,0:00:00.00,{end_time_ass},Watermark,,0,0,0,,{{\\pos({cx},{cy})\\an5}}{watermark_text}"
+            )
+        else:
+            dialogue_lines.insert(
+                0,
+                f"Dialogue: 10,0:00:00.00,{end_time_ass},Watermark,,0,0,0,,{watermark_text}"
+            )
         rendered_cnt += 1
 
     return header + "\n".join(dialogue_lines) + "\n", rendered_cnt
@@ -599,12 +684,24 @@ class SubtitleRenderConfig:
     watermark_font_size: int = 36
     watermark_opacity: float = 0.35
     watermark_color: str = "#FFFFFF"
+    watermark_custom_rect: tuple[float, float, float, float] | None = None
     # Logo thương hiệu cấu hình
     enable_brand_logo: bool = False
     brand_logo_path: str = ""
     brand_logo_position: str = "top_left"
     brand_logo_size_percent: int = 15
     brand_logo_opacity: float = 1.0
+    brand_logo_custom_rect: tuple[float, float, float, float] | None = None
+    # Khung viền video trang trí cấu hình (che viền trên/dưới & che logo)
+    enable_frame_border: bool = False
+    frame_border_top_path: str = ""
+    frame_border_bottom_path: str = ""
+    frame_border_path: str = ""
+    frame_border_opacity: float = 1.0
+    frame_border_top_height: int = 0      # Chiều cao viền trên (px), 0 = tự động theo tỉ lệ gốc
+    frame_border_bottom_height: int = 0   # Chiều cao viền dưới (px), 0 = tự động theo tỉ lệ gốc
+    # Tỷ lệ thu phóng video kiểu CapCut (100% - 150%, zoom từ tâm)
+    video_scale_percent: int = 100
     # Xóa / Tẩy Logo & Watermark video gốc (Bilibili, Douyin, Bản quyền mờ)
     delogo_bilibili: bool = False
     delogo_watermark: bool = False
@@ -612,6 +709,8 @@ class SubtitleRenderConfig:
     delogo_watermark_mode: str = "delogo"  # "delogo" (Xóa sạch tàng hình, 0s), "telea", "boxblur"
     delogo_custom_rect: tuple[float, float, float, float] | None = None
     delogo_custom_mode: Literal["delogo", "boxblur", "inpaint"] = "inpaint"
+    dynamic_mask: bool = False             # Mặt nạ mờ Động theo thời gian (chỉ mờ khi có chữ, hết chữ biến mất)
+    blur_rect_2: tuple[float, float, float, float] | None = None  # Khung OCR 2 (Đỉnh) nếu dùng quét 2 khung
 
 
 @dataclass
@@ -626,12 +725,25 @@ class VideoExportRequest:
     enable_blur_mask: bool = True
     mask_mode: str = "box"                # Kiểu mặt nạ: "blur" (Ảnh 1), "box" (Ảnh 2), "none"
     blur_rect: tuple[float, float, float, float] | None = None
+    blur_rect_2: tuple[float, float, float, float] | None = None  # Khung OCR 2 (Đỉnh) nếu dùng quét 2 khung
+    dynamic_mask: bool = False            # Giải pháp 2: Mặt nạ mờ Động theo thời gian (Dynamic Time-based Mask)
     # Brand logo settings
     enable_brand_logo: bool = False
     brand_logo_path: str = ""
     brand_logo_position: str = "top_left"
     brand_logo_size_percent: int = 15
     brand_logo_opacity: float = 1.0
+    brand_logo_custom_rect: tuple[float, float, float, float] | None = None
+    # Frame border overlay settings (che viền trên/dưới & che logo)
+    enable_frame_border: bool = False
+    frame_border_top_path: str = ""
+    frame_border_bottom_path: str = ""
+    frame_border_path: str = ""
+    frame_border_opacity: float = 1.0
+    frame_border_top_height: int = 0      # Chiều cao viền trên (px), 0 = tự động theo tỉ lệ gốc
+    frame_border_bottom_height: int = 0   # Chiều cao viền dưới (px), 0 = tự động theo tỉ lệ gốc
+    # Tỷ lệ thu phóng video kiểu CapCut (100% - 150%, zoom từ tâm)
+    video_scale_percent: int = 100
     # Text watermark settings
     enable_watermark: bool = False
     watermark_text: str = ""
@@ -639,6 +751,7 @@ class VideoExportRequest:
     watermark_font_size: int = 36
     watermark_opacity: float = 0.35
     watermark_color: str = "#FFFFFF"
+    watermark_custom_rect: tuple[float, float, float, float] | None = None
     # Xóa / Tẩy Logo & Watermark video gốc (Bilibili, Douyin, Bản quyền mờ)
     delogo_bilibili: bool = False
     delogo_watermark: bool = False
@@ -647,6 +760,7 @@ class VideoExportRequest:
     delogo_custom_rect: tuple[float, float, float, float] | None = None
     delogo_custom_mode: Literal["delogo", "boxblur", "inpaint"] = "inpaint"
     progress_callback: Any = None
+    is_cancelled_func: Any = None
 
 
 def build_delogo_filters(
@@ -700,23 +814,17 @@ def build_delogo_filters(
         current_v = out_v
         idx += 1
 
-    # 2. Xóa Watermark chữ bản quyền: XÓA SẠCH TÀNG HÌNH BẰNG DELOGO NỘI SUY (TUYỆT ĐỐI KHÔNG DÙNG MẶT NẠ MỜ CHE Ở GIỮA)
-    if delogo_watermark:
-        if delogo_watermark_rect and len(delogo_watermark_rect) == 4 and delogo_watermark_rect[2] > 0.01:
-            rx, ry, rw, rh = delogo_watermark_rect
-            # Giới hạn an toàn: Nếu vùng chọn quá cao (> 5.5% chiều cao video), delogo nội suy sẽ tạo vệt sọc đứng biến dạng
-            # Tự động thu hẹp chiều cao về vùng trung tâm thực tế của chữ mờ (cao ~4.8% video) để xóa sạch mịn màng
-            if rh > 0.055:
-                ry_center = ry + rh / 2.0
-                rh = 0.048
-                ry = max(0.01, ry_center - rh / 2.0)
-        elif is_vertical:
-            rx, ry, rw, rh = 0.25, 0.65, 0.50, 0.045
-        else:
-            rx, ry, rw, rh = 0.35, 0.49, 0.30, 0.045
+    # 2. Xóa Watermark chữ bản quyền: CHỈ ÁP DỤNG KHI BẬT VÀ CÓ VÙNG CHỌN TÙY CHỈNH HỢP LỆ
+    # Tuyệt đối không dùng tọa độ mặc định ở giữa màn hình (y=49%) để tránh tạo vết mờ che ngực/mắt nhân vật!
+    if delogo_watermark and delogo_watermark_rect and len(delogo_watermark_rect) == 4 and delogo_watermark_rect[2] > 0.01:
+        rx, ry, rw, rh = delogo_watermark_rect
+        # Giới hạn an toàn: Nếu vùng chọn quá cao (> 5.5% chiều cao video), delogo nội suy sẽ tạo vệt sọc đứng biến dạng
+        if rh > 0.055:
+            ry_center = ry + rh / 2.0
+            rh = 0.048
+            ry = max(0.01, ry_center - rh / 2.0)
         bx, by, bw, bh = _sanitize_box(rx, ry, rw, rh)
         out_v = f"v_wm_{idx}"
-        # Thuật toán Delogo nội suy điểm ảnh: Tẩy sạch dòng chữ mà giữ nguyên 100% bối cảnh gốc, không để lại vết mờ
         filters.append(f"[{current_v}]delogo=x={bx}:y={by}:w={bw}:h={bh}:show=0[{out_v}]")
         current_v = out_v
         idx += 1
@@ -732,9 +840,11 @@ def build_delogo_filters(
                 bx, by, bw, bh = _sanitize_box(crx, cry, crw, crh)
                 out_v = f"v_custom_{idx}"
                 if str(delogo_custom_mode).lower() == "boxblur":
-                    min_dim = min(bw, bh)
-                    luma_r = max(2, min(10, int(min_dim // 3)))
-                    chroma_r = max(1, min(5, int(min_dim // 6)))
+                    min_dim = max(2, min(bw, bh))
+                    max_luma_r = max(1, (min_dim - 1) // 2)
+                    max_chroma_r = max(0, ((min_dim // 2) - 1) // 2)
+                    luma_r = max(1, min(10, max_luma_r))
+                    chroma_r = max(0, min(luma_r // 2, max_chroma_r))
                     filters.append(
                         f"[{current_v}]split[v_main_{idx}][v_crop_{idx}];"
                         f"[v_crop_{idx}]crop={bw}:{bh}:{bx}:{by},boxblur={luma_r}:2:{chroma_r}:2[v_blur_{idx}];"
@@ -925,6 +1035,7 @@ class VideoExportService:
             # =====================================================================
             warning_msg = ""
             vid_w, vid_h = probe_video_dimensions(request.original_video_path, self.ffprobe_bin)
+            is_vertical = vid_h > vid_w
             filter_chains: list[str] = []
             current_v = "0:v"
 
@@ -979,12 +1090,59 @@ class VideoExportService:
                 except Exception as inpaint_exc:
                     print(f"[ExportVideo] Inpainting notice: {inpaint_exc}")
 
-            # 3.1. Nhận diện cấu hình Brand Logo trước để phối hợp tránh tạo vết mờ che logo góc trên phải
+            # 3.1. Nhận diện cấu hình Brand Logo & Khung Viền Video (Viền Trên / Viền Dưới) trước
+            enable_border = bool(getattr(request, "enable_frame_border", False) or getattr(cfg, "enable_frame_border", False))
+            top_border_path = str(
+                getattr(request, "frame_border_top_path", "")
+                or getattr(cfg, "frame_border_top_path", "")
+                or getattr(request, "frame_border_path", "")
+                or getattr(cfg, "frame_border_path", "")
+            ).strip()
+            bottom_border_path = str(
+                getattr(request, "frame_border_bottom_path", "")
+                or getattr(cfg, "frame_border_bottom_path", "")
+            ).strip()
+            has_top_border = bool(enable_border and top_border_path and os.path.isfile(top_border_path))
+            has_bottom_border = bool(enable_border and bottom_border_path and os.path.isfile(bottom_border_path))
+
             enable_logo = getattr(request, "enable_brand_logo", False) or getattr(cfg, "enable_brand_logo", False)
             logo_path = str(getattr(request, "brand_logo_path", "") or getattr(cfg, "brand_logo_path", "")).strip()
             has_logo = enable_logo and bool(logo_path) and os.path.isfile(logo_path)
             logo_pos = str(getattr(request, "brand_logo_position", None) or getattr(cfg, "brand_logo_position", "top_left") or "top_left").strip().lower()
             has_top_right_logo = (has_logo and logo_pos == "top_right")
+
+            # Phân bổ index input cho FFmpeg (0:v video, 1:a audio, sau đó là viền trên, viền dưới và logo)
+            top_border_input_idx = -1
+            bottom_border_input_idx = -1
+            logo_input_idx = -1
+            extra_ffmpeg_inputs = []
+            next_input_idx = 2
+            if has_top_border:
+                top_border_input_idx = next_input_idx
+                next_input_idx += 1
+                extra_ffmpeg_inputs.extend(["-i", top_border_path])
+            if has_bottom_border:
+                bottom_border_input_idx = next_input_idx
+                next_input_idx += 1
+                extra_ffmpeg_inputs.extend(["-i", bottom_border_path])
+            if has_logo:
+                logo_input_idx = next_input_idx
+                next_input_idx += 1
+                extra_ffmpeg_inputs.extend(["-i", logo_path])
+
+            # 3.1a. Tỷ lệ Thu Phóng Video (Zoom từ tâm như CapCut: 100% - 150%)
+            # Giúp phóng to video từ tâm, đẩy mép video, logo cũ và phụ đề gốc ra ngoài màn hình
+            zoom_pct = int(getattr(request, "video_scale_percent", 100) or getattr(cfg, "video_scale_percent", 100) or 100)
+            if zoom_pct > 100:
+                zoom_pct = min(200, zoom_pct)
+                scale_factor = zoom_pct / 100.0
+                scaled_w = int(round(vid_w * scale_factor / 2.0)) * 2
+                scaled_h = int(round(vid_h * scale_factor / 2.0)) * 2
+                filter_chains.append(
+                    f"[{current_v}]scale={scaled_w}:{scaled_h},crop={vid_w}:{vid_h}:(in_w-{vid_w})/2:(in_h-{vid_h})/2[v_zoomed]"
+                )
+                current_v = "v_zoomed"
+                print(f"[ExportVideo] Applied Video Zoom (CapCut style): {zoom_pct}% ({vid_w}x{vid_h} -> {scaled_w}x{scaled_h} -> crop center)")
 
             delogo_wm_rect = getattr(request, "delogo_watermark_rect", None) or getattr(cfg, "delogo_watermark_rect", None)
             delogo_wm_mode = getattr(request, "delogo_watermark_mode", "delogo") or getattr(cfg, "delogo_watermark_mode", "delogo")
@@ -1005,8 +1163,10 @@ class VideoExportService:
                 print(f"[ExportVideo] Applied delogo filters ({len(delogo_filters)}): bili={delogo_bili}, wm={delogo_wm}, custom={bool(delogo_c_rect)}")
 
             # 3.2. Cấu hình Mặt Nạ Che Chữ và Xác Định Vị Trí Phụ Đề
-            enable_blur = getattr(request, "enable_blur_mask", True) and getattr(cfg, "enable_blur_mask", True)
-            mask_mode = str(getattr(cfg, "mask_mode", None) or getattr(request, "mask_mode", None) or "blur").strip().lower()
+            enable_blur = getattr(request, "enable_blur_mask", None)
+            if enable_blur is None:
+                enable_blur = getattr(cfg, "enable_blur_mask", True)
+            mask_mode = str(getattr(request, "mask_mode", None) or getattr(cfg, "mask_mode", None) or "blur").strip().lower()
 
             # Lấy thông tin user_rect (khung OCR hoặc khung che chữ do người dùng chỉ định)
             user_rect = request.blur_rect or getattr(cfg, "blur_rect", None)
@@ -1022,34 +1182,61 @@ class VideoExportService:
 
             # Xác định tọa độ Y trung tâm của phụ đề để đè mặt nạ và chữ tiếng Việt lên đúng chữ tiếng Trung gốc
             target_cy = None
+            user_rect_2 = getattr(request, "blur_rect_2", None) or getattr(cfg, "blur_rect_2", None)
+            is_dual_mode = bool(user_rect_2 and len(user_rect_2) == 4 and user_rect_2[2] > 0 and user_rect_2[3] > 0)
 
-            # 1. ƯU TIÊN SỐ 1: Tôn trọng tuyệt đối khung OCR / Vùng che do người dùng thiết lập
+            # Thu thập tọa độ bbox thực tế của các câu thoại tiếng Trung ở KHUNG ĐÁY (nếu OCR đã ghi nhận)
+            valid_segs_with_bbox = []
+            for s in request.segments:
+                if str(getattr(s, "translated_text", "") or getattr(s, "text", "") or "").strip() and not getattr(s, "is_noise", False):
+                    # Nếu là câu ở Đỉnh (top / box 2), bỏ qua không tính vào vị trí đáy
+                    if getattr(s, "position", "") == "top" or getattr(s, "ocr_box_index", 1) == 2:
+                        continue
+                    bb = getattr(s, "bbox", None)
+                    if bb and len(bb) == 4:
+                        try:
+                            by1, by2 = float(bb[1]), float(bb[3])
+                            # Chỉ lấy các bbox ở nửa dưới màn hình (y >= 0.40) cho khung đáy
+                            if 0.40 <= by1 < by2 <= 0.98 and (by2 - by1) <= 0.20:
+                                valid_segs_with_bbox.append((by1 + by2) / 2.0)
+                        except Exception:
+                            pass
+
+            detected_bbox_cy = None
+            detected_bbox_norm_y = None
+            if valid_segs_with_bbox:
+                valid_segs_with_bbox.sort()
+                mid_idx = len(valid_segs_with_bbox) // 2
+                detected_bbox_norm_y = valid_segs_with_bbox[mid_idx]
+                detected_bbox_cy = int(round(detected_bbox_norm_y * vid_h))
+                print(f"[ExportVideo] Detected actual Chinese bottom text bbox center: cy={detected_bbox_cy}px (y={detected_bbox_norm_y:.2f})")
+
+            # 1. ƯU TIÊN SỐ 1: Tôn trọng khung người dùng
             if user_rect and len(user_rect) == 4 and user_rect[2] > 0 and user_rect[3] > 0:
-                target_cy = int(round((user_rect[1] + user_rect[3] / 2.0) * vid_h))
-                print(f"[ExportVideo] Subtitle target center from user blur_rect: cy={target_cy}px (y={user_rect[1]:.2f}, h={user_rect[3]:.2f})")
+                raw_user_cy = int(round((user_rect[1] + user_rect[3] / 2.0) * vid_h))
+                if is_dual_mode:
+                    # Ở chế độ 2 Khung OCR: TÔN TRỌNG TUYỆT ĐỐI khung do người dùng vẽ, không tự ý nắn lệch
+                    target_cy = raw_user_cy
+                    print(f"[ExportVideo] Dual OCR Mode: Preserving exact user blur_rect (cy={target_cy}px, y={user_rect[1]:.2f}, h={user_rect[3]:.2f})")
+                elif detected_bbox_cy is not None and abs(raw_user_cy - detected_bbox_cy) > int(round(vid_h * 0.06)):
+                    # Chế độ 1 khung: nếu lệch quá 6% chiều cao -> user_rect bị đặt sai (vd 65% trong khi chữ ở 88%)
+                    print(f"[ExportVideo] user_rect (cy={raw_user_cy}px) is offset from real text (cy={detected_bbox_cy}px). Auto-anchoring to real text position!")
+                    target_cy = detected_bbox_cy
+                    real_h = max(0.08, min(0.14, user_rect[3]))
+                    real_y = max(0.0, min(1.0 - real_h, detected_bbox_norm_y - real_h / 2.0))
+                    user_rect = (user_rect[0], real_y, user_rect[2], real_h)
+                else:
+                    target_cy = raw_user_cy
+                    print(f"[ExportVideo] Subtitle target center from user blur_rect: cy={target_cy}px (y={user_rect[1]:.2f}, h={user_rect[3]:.2f})")
 
-            # 2. ƯU TIÊN SỐ 2: Kiểm tra bbox trong các segments (nếu OCR đã ghi nhận tọa độ chữ tiếng Trung)
-            if target_cy is None:
-                valid_segs_with_bbox = []
-                for s in request.segments:
-                    if str(getattr(s, "translated_text", "") or "").strip() and not getattr(s, "is_noise", False):
-                        bb = getattr(s, "bbox", None)
-                        if bb and len(bb) == 4:
-                            try:
-                                by1, by2 = float(bb[1]), float(bb[3])
-                                if 0.10 <= by1 < by2 <= 0.98 and (by2 - by1) <= 0.18:
-                                    valid_segs_with_bbox.append((by1 + by2) / 2.0)
-                            except Exception:
-                                pass
-                if valid_segs_with_bbox:
-                    valid_segs_with_bbox.sort()
-                    mid_idx = len(valid_segs_with_bbox) // 2
-                    target_cy = int(round(valid_segs_with_bbox[mid_idx] * vid_h))
-                    print(f"[ExportVideo] Subtitle target center from segment bbox: cy={target_cy}px")
+            # 2. ƯU TIÊN SỐ 2: Sử dụng detected_bbox_cy nếu không có user_rect
+            if target_cy is None and detected_bbox_cy is not None:
+                target_cy = detected_bbox_cy
+                print(f"[ExportVideo] Subtitle target center from segment bbox: cy={target_cy}px")
 
-            # 3. ƯU TIÊN SỐ 3: Nếu không có user_rect và segments chưa có bbox, tự động dò vị trí chữ tiếng Trung thoại thực tế trên video
+            # 3. ƯU TIÊN SỐ 3: Nếu chưa có, tự động dò vị trí chữ tiếng Trung thoại thực tế trên video
             if target_cy is None:
-                valid_segs = [s for s in request.segments if str(getattr(s, "translated_text", "") or "").strip() and not getattr(s, "is_noise", False)]
+                valid_segs = [s for s in request.segments if str(getattr(s, "translated_text", "") or getattr(s, "text", "") or "").strip() and not getattr(s, "is_noise", False)]
                 sample_times = [(s.start + s.end) / 2.0 for s in valid_segs if s.end > s.start][:6]
                 bot_detected, _ = auto_detect_video_bands(
                     request.original_video_path,
@@ -1061,34 +1248,76 @@ class VideoExportService:
                     target_cy = int(round((bot_detected[1] + bot_detected[3] / 2.0) * vid_h))
                     print(f"[ExportVideo] Subtitle target center from auto detector: cy={target_cy}px")
 
-            # 4. Fallback cuối cùng theo tỷ lệ chuẩn video dọc 9:16 (74.3%) hoặc video ngang 16:9 (83%)
+            # 4. Fallback cuối cùng theo tỷ lệ chuẩn video dọc 9:16 (76%) hoặc video ngang 16:9 (86% sát đáy)
             if target_cy is None:
-                target_cy = int(round(vid_h * (0.743 if vid_h > vid_w else 0.83)))
+                target_cy = int(round(vid_h * (0.76 if vid_h > vid_w else 0.86)))
 
-            # 3.3. Áp dụng Mặt Nạ Làm Mờ (Blur Mask): Che sạch chữ Trung gốc gọn gàng thanh thoát
+            user_rect_2 = getattr(request, "blur_rect_2", None) or getattr(cfg, "blur_rect_2", None)
+
+            # 3.3. Áp dụng Mặt Nạ Làm Mờ (Blur Mask): Che sạch chữ Trung gốc ôm sát nhất, không to thừa chiếm diện tích
             if enable_blur and mask_mode == "blur":
+                # Đo lường kích thước chữ Trung thực tế từ các segment để mặt nạ ôm khít rịt
+                bot_text_hs = []
+                bot_text_xs = []
+                for s in request.segments:
+                    if getattr(s, "is_noise", False) or s.end <= s.start:
+                        continue
+                    is_top = (getattr(s, "position", "") == "top" or getattr(s, "ocr_box_index", 1) == 2)
+                    bb = getattr(s, "bbox", None)
+                    if not is_top and bb and len(bb) == 4:
+                        try:
+                            by1, by2 = float(bb[1]), float(bb[3])
+                            bx1, bx2 = float(bb[0]), float(bb[2])
+                            if by1 < 0.45:
+                                is_top = True
+                            elif 0.015 <= (by2 - by1) <= 0.18 and 0.02 <= (bx2 - bx1) <= 0.98:
+                                bot_text_hs.append((by2 - by1) * vid_h)
+                                bot_text_xs.append((bx1 * vid_w, bx2 * vid_w))
+                        except Exception:
+                            pass
+
+                # Chiều cao bám sát thực tế của chữ Trung
+                if bot_text_hs:
+                    bot_text_hs.sort()
+                    med_chinese_h = bot_text_hs[len(bot_text_hs) // 2]
+                    tight_strip_h = max(int(round(med_chinese_h * 1.25)), int(round(vid_h * 0.038)))
+                else:
+                    tight_strip_h = int(round(vid_h * (0.045 if is_vertical else 0.038)))
+
+                # Chiều rộng bám sát câu thoại dài nhất (tránh dải mờ kéo dài 1600px chiếm trọn video)
+                if bot_text_xs:
+                    all_x1 = [x[0] for x in bot_text_xs]
+                    all_x2 = [x[1] for x in bot_text_xs]
+                    min_bx = min(all_x1)
+                    max_bx = max(all_x2)
+                    span_w = max_bx - min_bx
+                    mid_bx = (min_bx + max_bx) / 2.0
+                    pad_edge = max(24, int(round(vid_w * 0.030)))
+                    tight_strip_w = int(round(span_w)) + pad_edge * 2
+                    tight_strip_x = int(round(mid_bx - tight_strip_w / 2.0))
+                else:
+                    tight_strip_w = int(round(vid_w * (0.65 if is_vertical else 0.55)))
+                    tight_strip_x = (vid_w - tight_strip_w) // 2
+
                 if user_rect and len(user_rect) == 4 and user_rect[2] > 0 and user_rect[3] > 0:
                     ocr_y = int(round(user_rect[1] * vid_h))
                     ocr_h = int(round(user_rect[3] * vid_h))
                     ocr_x = int(round(user_rect[0] * vid_w))
                     ocr_w = int(round(user_rect[2] * vid_w))
 
-                    # Thu hẹp chiều cao thanh thoát vừa vặn ôm khít chữ Trung, tuyệt đối không phình to
-                    pad_v = max(2, int(round(vid_h * 0.003)))
-                    strip_y = max(0, ocr_y - pad_v)
-                    strip_h = ocr_h + pad_v * 2
-
-                    # Về chiều rộng: Chỉ làm mờ trong phạm vi dòng chữ Trung (mở rộng nhẹ 2 bên để êm biên)
-                    # KHÔNG KÉO DÀI HẾT TOÀN BỘ CHIỀU NGANG VIDEO làm đen cả đáy màn hình
-                    pad_h = max(20, int(round(vid_w * 0.04)))
-                    strip_x = max(0, ocr_x - pad_h)
-                    strip_w = min(vid_w - strip_x, ocr_w + pad_h * 2)
-                else:
-                    # Fallback thanh thoát gọn gàng ở chân trang
-                    strip_h = int(round(vid_h * (0.048 if vid_h > vid_w else 0.040)))
+                    # 1. Chiều cao: Ưu tiên bám sát chữ Trung thực tế tight_strip_h thay vì lấy cả khung quét OCR to
+                    strip_h = min(ocr_h, tight_strip_h) if ocr_h < tight_strip_h else tight_strip_h
                     strip_y = max(0, target_cy - strip_h // 2)
-                    strip_w = int(round(vid_w * 0.75))
-                    strip_x = (vid_w - strip_w) // 2
+
+                    # 2. Chiều rộng: Bám sát câu thoại dài nhất tight_strip_w (không kéo dài 1644px khắp màn hình)
+                    strip_w = min(ocr_w, tight_strip_w)
+                    target_cx = tight_strip_x + tight_strip_w // 2 if bot_text_xs else (ocr_x + ocr_w // 2)
+                    strip_x = max(0, min(vid_w - strip_w, target_cx - strip_w // 2))
+                else:
+                    strip_h = tight_strip_h
+                    strip_y = max(0, target_cy - strip_h // 2)
+                    strip_w = tight_strip_w
+                    strip_x = max(0, min(vid_w - strip_w, tight_strip_x))
 
                 # Đảm bảo số chẵn cho chuẩn yuv420p
                 strip_x = strip_x - (strip_x % 2)
@@ -1103,14 +1332,150 @@ class VideoExportService:
                 # Căn giữa phụ đề tiếng Việt chuẩn xác tại tâm dải làm mờ
                 target_cy = strip_y + strip_h // 2
 
-                # boxblur=12:2: Làm mờ mịn nhẹ nhàng, chỉ nằm gọn ở vùng có chữ, 2 bên màn hình giữ nguyên độ nét
-                filter_chains.append(
-                    f"[{current_v}]split[v_base_strip][v_crop_strip];"
-                    f"[v_crop_strip]crop={strip_w}:{strip_h}:{strip_x}:{strip_y},boxblur=12:2[v_blur_strip];"
-                    f"[v_base_strip][v_blur_strip]overlay={strip_x}:{strip_y}[v_masked]"
-                )
-                current_v = "v_masked"
-                print(f"[ExportVideo] Applied Blur Mask Strip (Thanh thoát): x={strip_x}px, y={strip_y}px, w={strip_w}px, h={strip_h}px")
+                # Tính bán kính Luma và Chroma an toàn cho FFmpeg boxblur (tránh lỗi invalid chroma_param radius <= max_r)
+                min_strip_dim = max(2, min(strip_w, strip_h))
+                max_luma_r = max(1, (min_strip_dim - 1) // 2)
+                max_chroma_r = max(0, ((min_strip_dim // 2) - 1) // 2)
+                blur_luma_r = max(1, min(12, max_luma_r))
+                blur_chroma_r = max(0, min(blur_luma_r // 2, max_chroma_r))
+
+                # boxblur: Làm mờ mịn nhẹ nhàng, chỉ nằm gọn ở vùng có chữ, 2 bên màn hình giữ nguyên độ nét
+                is_dyn_mask = bool(getattr(request, "dynamic_mask", False))
+                if is_dyn_mask:
+                    # GIẢI PHÁP 2: Mặt nạ mờ Động theo thời gian (Dynamic Time-based Mask)
+                    # Chỉ mờ đúng lúc có câu thoại, hết câu mờ tự động biến mất 100%
+                    top_intervals: list[tuple[float, float]] = []
+                    bot_intervals: list[tuple[float, float]] = []
+                    top_cys: list[float] = []
+                    for s in request.segments:
+                        if not str(getattr(s, "translated_text", "") or getattr(s, "text", "") or "").strip():
+                            continue
+                        if getattr(s, "is_noise", False) or s.end <= s.start:
+                            continue
+                        is_top = (getattr(s, "position", "") == "top" or getattr(s, "ocr_box_index", 1) == 2)
+                        if not is_top and getattr(s, "bbox", None) and len(s.bbox) == 4:
+                            try:
+                                is_top = float(s.bbox[1]) < 0.45
+                            except Exception:
+                                pass
+                        if is_top:
+                            top_intervals.append((float(s.start), float(s.end)))
+                            if getattr(s, "bbox", None) and len(s.bbox) == 4:
+                                try:
+                                    top_cys.append((float(s.bbox[1]) + float(s.bbox[3])) / 2.0)
+                                except Exception:
+                                    pass
+                        else:
+                            bot_intervals.append((float(s.start), float(s.end)))
+
+                    merged_bot = merge_time_intervals(bot_intervals)
+                    merged_top = merge_time_intervals(top_intervals)
+                    enable_bot = build_ffmpeg_between_expression(merged_bot)
+                    enable_top = build_ffmpeg_between_expression(merged_top)
+
+                    # 1. Mặt nạ mờ động phía DƯỚI (Bottom)
+                    if enable_bot:
+                        filter_chains.append(
+                            f"[{current_v}]split[v_base_strip][v_crop_strip];"
+                            f"[v_crop_strip]crop={strip_w}:{strip_h}:{strip_x}:{strip_y},boxblur={blur_luma_r}:2:{blur_chroma_r}:2[v_blur_strip];"
+                            f"[v_base_strip][v_blur_strip]overlay={strip_x}:{strip_y}:enable='{enable_bot}'[v_masked]"
+                        )
+                        current_v = "v_masked"
+                        print(f"[ExportVideo] Applied Dynamic Bottom Blur Mask ({len(merged_bot)} intervals): enable='{enable_bot[:60]}...'")
+
+                    # 2. Mặt nạ mờ động phía TRÊN (Top): Neo theo user_rect_2 hoặc bbox thực tế của câu thoại trên đỉnh
+                    if enable_top:
+                        top_text_hs = []
+                        top_text_xs = []
+                        for s in request.segments:
+                            if getattr(s, "is_noise", False) or s.end <= s.start:
+                                continue
+                            is_top = (getattr(s, "position", "") == "top" or getattr(s, "ocr_box_index", 1) == 2)
+                            bb = getattr(s, "bbox", None)
+                            if not is_top and bb and len(bb) == 4:
+                                try:
+                                    if float(bb[1]) < 0.45:
+                                        is_top = True
+                                except Exception:
+                                    pass
+                            if is_top and bb and len(bb) == 4:
+                                try:
+                                    by1, by2 = float(bb[1]), float(bb[3])
+                                    bx1, bx2 = float(bb[0]), float(bb[2])
+                                    if 0.015 <= (by2 - by1) <= 0.18 and 0.02 <= (bx2 - bx1) <= 0.98:
+                                        top_text_hs.append((by2 - by1) * vid_h)
+                                        top_text_xs.append((bx1 * vid_w, bx2 * vid_w))
+                                except Exception:
+                                    pass
+
+                        if top_text_hs:
+                            top_text_hs.sort()
+                            top_med_h = top_text_hs[len(top_text_hs) // 2]
+                            top_tight_h = max(int(round(top_med_h * 1.25)), int(round(vid_h * 0.038)))
+                        else:
+                            top_tight_h = int(round(vid_h * (0.045 if is_vertical else 0.038)))
+
+                        if top_text_xs:
+                            all_tx1 = [x[0] for x in top_text_xs]
+                            all_tx2 = [x[1] for x in top_text_xs]
+                            min_tx = min(all_tx1)
+                            max_tx = max(all_tx2)
+                            top_span_w = max_tx - min_tx
+                            top_mid_x = (min_tx + max_tx) / 2.0
+                            top_pad_edge = max(24, int(round(vid_w * 0.030)))
+                            top_tight_w = int(round(top_span_w)) + top_pad_edge * 2
+                            top_tight_x = int(round(top_mid_x - top_tight_w / 2.0))
+                        else:
+                            top_tight_w = strip_w
+                            top_tight_x = strip_x
+
+                        if user_rect_2 and len(user_rect_2) == 4 and user_rect_2[2] > 0 and user_rect_2[3] > 0:
+                            top_ocr_x = int(round(user_rect_2[0] * vid_w))
+                            top_ocr_y = int(round(user_rect_2[1] * vid_h))
+                            top_ocr_w = int(round(user_rect_2[2] * vid_w))
+                            top_ocr_h = int(round(user_rect_2[3] * vid_h))
+                            top_target_cy = int(round((user_rect_2[1] + user_rect_2[3] / 2.0) * vid_h))
+
+                            top_strip_h = min(top_ocr_h, top_tight_h) if top_ocr_h < top_tight_h else top_tight_h
+                            top_strip_y = max(0, top_target_cy - top_strip_h // 2)
+                            top_strip_w = min(top_ocr_w, top_tight_w)
+                            top_mid = top_tight_x + top_tight_w // 2 if top_text_xs else (top_ocr_x + top_ocr_w // 2)
+                            top_strip_x = max(0, min(vid_w - top_strip_w, top_mid - top_strip_w // 2))
+                        else:
+                            avg_top_cy = (sum(top_cys) / len(top_cys)) if top_cys else (0.16 if vid_h > vid_w else 0.14)
+                            top_strip_h = top_tight_h
+                            top_strip_y = max(0, int(round(vid_h * avg_top_cy)) - top_strip_h // 2)
+                            top_strip_w = top_tight_w
+                            top_strip_x = max(0, min(vid_w - top_strip_w, top_tight_x))
+                        top_strip_x = top_strip_x - (top_strip_x % 2)
+                        top_strip_y = top_strip_y - (top_strip_y % 2)
+                        top_strip_w = top_strip_w + (top_strip_w % 2)
+                        top_strip_h = top_strip_h + (top_strip_h % 2)
+                        if top_strip_x + top_strip_w > vid_w:
+                            top_strip_w = vid_w - top_strip_x
+                        if top_strip_y + top_strip_h > vid_h:
+                            top_strip_h = vid_h - top_strip_y
+
+                        min_top_dim = max(2, min(top_strip_w, top_strip_h))
+                        top_blur_luma_r = max(1, min(12, (min_top_dim - 1) // 2))
+                        top_blur_chroma_r = max(0, min(top_blur_luma_r // 2, ((min_top_dim // 2) - 1) // 2))
+
+                        filter_chains.append(
+                            f"[{current_v}]split[v_base_top][v_crop_top];"
+                            f"[v_crop_top]crop={top_strip_w}:{top_strip_h}:{top_strip_x}:{top_strip_y},boxblur={top_blur_luma_r}:2:{top_blur_chroma_r}:2[v_blur_top];"
+                            f"[v_base_top][v_blur_top]overlay={top_strip_x}:{top_strip_y}:enable='{enable_top}'[v_masked_top]"
+                        )
+                        current_v = "v_masked_top"
+                        print(f"[ExportVideo] Applied Dynamic Top Blur Mask ({len(merged_top)} intervals): enable='{enable_top[:60]}...'")
+                else:
+                    # Luồng cũ chuẩn hóa: Mờ cố định toàn video
+                    filter_chains.append(
+                        f"[{current_v}]split[v_base_strip][v_crop_strip];"
+                        f"[v_crop_strip]crop={strip_w}:{strip_h}:{strip_x}:{strip_y},boxblur={blur_luma_r}:2:{blur_chroma_r}:2[v_blur_strip];"
+                        f"[v_base_strip][v_blur_strip]overlay={strip_x}:{strip_y}[v_masked]"
+                    )
+                    current_v = "v_masked"
+                    print(f"[ExportVideo] Applied Blur Mask Strip (Thanh thoát): x={strip_x}px, y={strip_y}px, w={strip_w}px, h={strip_h}px (luma_r={blur_luma_r}, chroma_r={blur_chroma_r})")
 
             # Đồng bộ cấu hình Watermark từ request sang cfg nếu có
             if getattr(request, "enable_watermark", False):
@@ -1135,8 +1500,48 @@ class VideoExportService:
                 enable_mask=enable_blur,
                 duration=max(t_video, t_audio),
                 user_rect=user_rect,
+                user_rect_2=user_rect_2,
                 mask_mode=mask_mode,
+                dynamic_mask=bool(getattr(request, "dynamic_mask", False)),
             )
+
+            # 3.4. DÁN KHUNG VIỀN VIDEO TRANG TRÍ (VIỀN TRÊN & VIỀN DƯỚI)
+            if has_top_border or has_bottom_border:
+                border_alpha = max(0.05, min(1.0, float(getattr(request, "frame_border_opacity", None) or getattr(cfg, "frame_border_opacity", 1.0) or 1.0)))
+                top_h = int(getattr(request, "frame_border_top_height", 0) or getattr(cfg, "frame_border_top_height", 0) or 0)
+                bot_h = int(getattr(request, "frame_border_bottom_height", 0) or getattr(cfg, "frame_border_bottom_height", 0) or 0)
+
+                if has_top_border:
+                    if top_h > 0:
+                        top_h_even = max(10, top_h - (top_h % 2))
+                        top_scale = f"scale={vid_w}:{top_h_even}"
+                    else:
+                        top_scale = f"scale={vid_w}:-2"
+                    filter_chains.append(
+                        f"[{top_border_input_idx}:v]format=rgba,{top_scale},"
+                        f"colorchannelmixer=aa={border_alpha:.2f}[top_border]"
+                    )
+                    filter_chains.append(
+                        f"[{current_v}][top_border]overlay=0:0:repeatlast=1[v_bordered_top]"
+                    )
+                    current_v = "v_bordered_top"
+                    print(f"[ExportVideo] Applied top frame border overlay: path='{top_border_path}', height={top_h or 'auto'}, alpha={border_alpha}")
+
+                if has_bottom_border:
+                    if bot_h > 0:
+                        bot_h_even = max(10, bot_h - (bot_h % 2))
+                        bot_scale = f"scale={vid_w}:{bot_h_even}"
+                    else:
+                        bot_scale = f"scale={vid_w}:-2"
+                    filter_chains.append(
+                        f"[{bottom_border_input_idx}:v]format=rgba,{bot_scale},"
+                        f"colorchannelmixer=aa={border_alpha:.2f}[bottom_border]"
+                    )
+                    filter_chains.append(
+                        f"[{current_v}][bottom_border]overlay=0:H-h:repeatlast=1[v_bordered_bot]"
+                    )
+                    current_v = "v_bordered_bot"
+                    print(f"[ExportVideo] Applied bottom frame border overlay: path='{bottom_border_path}', height={bot_h or 'auto'}, alpha={border_alpha}")
 
             if ass_rendered_cnt > 0:
                 with open(temp_ass_path, "w", encoding="utf-8") as af:
@@ -1147,7 +1552,7 @@ class VideoExportService:
                 current_v = "outv"
 
             # 3.5. DÁN LOGO THƯƠNG HIỆU LÊN LỚP TRÊN CÙNG (TOPMOST)
-            # Đảm bảo Logo luôn nằm trên cùng, sắc nét 100%, không bao giờ bị dải mờ hay phụ đề đè lên
+            # Đảm bảo Logo luôn nằm trên cùng, sắc nét 100%, đè lên cả lớp khung viền trang trí
             if has_logo:
                 logo_pct = max(5, min(50, int(getattr(request, "brand_logo_size_percent", None) or getattr(cfg, "brand_logo_size_percent", 15) or 15)))
                 # Sử dụng kích thước cạnh ngắn hơn min(vid_w, vid_h) để logo trên video ngang (16:9) không bị phình to gấp đôi và tụt xuống dưới
@@ -1155,26 +1560,35 @@ class VideoExportService:
                 target_logo_w = max(40, int(round(ref_dim * (logo_pct / 100.0))))
                 logo_alpha = max(0.1, min(1.0, float(getattr(request, "brand_logo_opacity", None) or getattr(cfg, "brand_logo_opacity", 1.0) or 1.0)))
 
-                filter_chains.append(
-                    f"[2:v]format=rgba,colorchannelmixer=aa={logo_alpha:.2f},scale={target_logo_w}:-1[brand_logo]"
-                )
-
-                margin_x = max(8, int(round(vid_w * 0.010)))
-                margin_y = max(8, int(round(vid_h * 0.010)))
-                if logo_pos == "top_left":
-                    pos_xy = f"{margin_x}:{margin_y}"
-                elif logo_pos == "top_right":
-                    pos_xy = f"main_w-overlay_w-{margin_x}:{margin_y}"
-                elif logo_pos == "bottom_left":
-                    pos_xy = f"{margin_x}:main_h-overlay_h-{margin_y}"
-                elif logo_pos == "bottom_right":
-                    pos_xy = f"main_w-overlay_w-{margin_x}:main_h-overlay_h-{margin_y}"
-                elif logo_pos == "center":
-                    pos_xy = "(main_w-overlay_w)/2:(main_h-overlay_h)/2"
-                elif logo_pos == "top_center":
-                    pos_xy = f"(main_w-overlay_w)/2:{margin_y}"
+                logo_custom_rect = getattr(request, "brand_logo_custom_rect", None) or getattr(cfg, "brand_logo_custom_rect", None)
+                if (logo_pos == "custom_rect" or getattr(request, "brand_logo_position", "") == "custom_rect") and logo_custom_rect and len(logo_custom_rect) == 4:
+                    lx, ly, lw, lh = logo_custom_rect
+                    if lw > 0.01:
+                        target_logo_w = max(20, int(round(vid_w * lw)))
+                    pos_x = max(0, int(round(vid_w * lx)))
+                    pos_y = max(0, int(round(vid_h * ly)))
+                    pos_xy = f"{pos_x}:{pos_y}"
                 else:
-                    pos_xy = f"{margin_x}:{margin_y}"
+                    margin_x = max(8, int(round(vid_w * 0.010)))
+                    margin_y = max(8, int(round(vid_h * 0.010)))
+                    if logo_pos == "top_left":
+                        pos_xy = f"{margin_x}:{margin_y}"
+                    elif logo_pos == "top_right":
+                        pos_xy = f"main_w-overlay_w-{margin_x}:{margin_y}"
+                    elif logo_pos == "bottom_left":
+                        pos_xy = f"{margin_x}:main_h-overlay_h-{margin_y}"
+                    elif logo_pos == "bottom_right":
+                        pos_xy = f"main_w-overlay_w-{margin_x}:main_h-overlay_h-{margin_y}"
+                    elif logo_pos == "center":
+                        pos_xy = "(main_w-overlay_w)/2:(main_h-overlay_h)/2"
+                    elif logo_pos == "top_center":
+                        pos_xy = f"(main_w-overlay_w)/2:{margin_y}"
+                    else:
+                        pos_xy = f"{margin_x}:{margin_y}"
+
+                filter_chains.append(
+                    f"[{logo_input_idx}:v]format=rgba,colorchannelmixer=aa={logo_alpha:.2f},scale={target_logo_w}:-1[brand_logo]"
+                )
 
                 filter_chains.append(
                     f"[{current_v}][brand_logo]overlay={pos_xy}:repeatlast=1[v_logo_final]"
@@ -1190,8 +1604,7 @@ class VideoExportService:
                 "-i", request.original_video_path,
                 "-i", request.final_audio_path,
             ]
-            if has_logo:
-                cmd.extend(["-i", logo_path])
+            cmd.extend(extra_ffmpeg_inputs)
 
             if filter_chains:
                 filter_script_path = os.path.join(
@@ -1231,7 +1644,7 @@ class VideoExportService:
                 "stderr": subprocess.PIPE,
             }
             if os.name == "nt":
-                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | 0x00008000
 
             proc = subprocess.Popen(cmd, **kwargs)
             stderr_chunks: list[bytes] = []
@@ -1246,10 +1659,18 @@ class VideoExportService:
             t_err = threading.Thread(target=_drain_stderr, daemon=True)
             t_err.start()
 
+            cancelled_early = False
             if progress_cb:
                 try:
                     last_pct_reported = -1.0
                     for raw_line in iter(proc.stdout.readline, b""):
+                        if getattr(request, "is_cancelled_func", None) and request.is_cancelled_func():
+                            cancelled_early = True
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            break
                         line = raw_line.decode("utf-8", errors="ignore").strip()
                         if line.startswith("out_time="):
                             t_val = line.split("=", 1)[1].strip()
@@ -1269,6 +1690,20 @@ class VideoExportService:
 
             proc.wait()
             t_err.join(timeout=2.0)
+
+            if cancelled_early or (getattr(request, "is_cancelled_func", None) and request.is_cancelled_func()):
+                try:
+                    if os.path.isfile(request.output_video_path):
+                        os.remove(request.output_video_path)
+                except Exception:
+                    pass
+                return VideoExportResult(
+                    output_video_path="",
+                    video_duration=t_video,
+                    audio_duration=t_audio,
+                    status="cancelled",
+                    error="Tiến trình xuất video đã bị hủy.",
+                )
 
             if proc.returncode != 0 or not os.path.isfile(request.output_video_path):
                 err_text = b"".join(stderr_chunks).decode("utf-8", errors="ignore") if stderr_chunks else "Unknown FFmpeg error"

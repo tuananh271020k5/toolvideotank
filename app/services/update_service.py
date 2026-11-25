@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -98,35 +97,47 @@ class UpdateService:
             "release_url": download_url,
         }
 
-    def _open_download_stream(self, url: str):
-        """Mở luồng tải dữ liệu hỗ trợ cả link trực tiếp và link Google Drive tự động."""
+    def _open_download_stream(self, url: str, max_retries: int = 5):
+        """Mở luồng tải dữ liệu hỗ trợ cả link trực tiếp và link Google Drive tự động, kèm tự động retry."""
         target_url = str(url or "").strip()
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
 
-        if "drive.google.com" in target_url or "drive.usercontent.google.com" in target_url:
-            m = re.search(r"/d/([a-zA-Z0-9_-]+)", target_url) or re.search(r"id=([a-zA-Z0-9_-]+)", target_url)
-            if m:
-                file_id = m.group(1)
-                init_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-                req = urllib.request.Request(init_url, headers=headers)
-                resp = urllib.request.urlopen(req, timeout=30)
-                content_type = str(resp.headers.get("content-type", "")).lower()
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                if "drive.google.com" in target_url or "drive.usercontent.google.com" in target_url:
+                    m = re.search(r"/d/([a-zA-Z0-9_-]+)", target_url) or re.search(r"id=([a-zA-Z0-9_-]+)", target_url)
+                    if m:
+                        file_id = m.group(1)
+                        init_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                        req = urllib.request.Request(init_url, headers=headers)
+                        resp = urllib.request.urlopen(req, timeout=120)
+                        content_type = str(resp.headers.get("content-type", "")).lower()
 
-                # Nếu Google trả về trang cảnh báo virus file lớn, bóc tách form để tải trực tiếp
-                if "text/html" in content_type:
-                    html = resp.read().decode("utf-8", errors="ignore")
-                    uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html)
-                    confirm_match = re.search(r'name="confirm"\s+value="([^"]+)"', html)
-                    uuid_val = uuid_match.group(1) if uuid_match else ""
-                    confirm_val = confirm_match.group(1) if confirm_match else "t"
-                    if uuid_val:
-                        dl_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={confirm_val}&uuid={uuid_val}"
-                        req2 = urllib.request.Request(dl_url, headers=headers)
-                        return urllib.request.urlopen(req2, timeout=60)
-                return resp
+                        # Nếu Google trả về trang cảnh báo virus file lớn, bóc tách form để tải trực tiếp
+                        if "text/html" in content_type:
+                            html = resp.read().decode("utf-8", errors="ignore")
+                            uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html)
+                            confirm_match = re.search(r'name="confirm"\s+value="([^"]+)"', html)
+                            uuid_val = uuid_match.group(1) if uuid_match else ""
+                            confirm_val = confirm_match.group(1) if confirm_match else "t"
+                            if uuid_val:
+                                dl_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={confirm_val}&uuid={uuid_val}"
+                                req2 = urllib.request.Request(dl_url, headers=headers)
+                                return urllib.request.urlopen(req2, timeout=180)
+                        return resp
 
-        req = urllib.request.Request(target_url, headers=headers)
-        return urllib.request.urlopen(req, timeout=30)
+                req = urllib.request.Request(target_url, headers=headers)
+                return urllib.request.urlopen(req, timeout=120)
+            except Exception as exc:
+                last_err = exc
+                time.sleep(2.0 * (attempt + 1))
+
+        raise last_err or Exception("Không thể kết nối máy chủ tải cập nhật sau nhiều lần thử.")
 
     def download_and_install_patch(
         self,
@@ -311,7 +322,7 @@ exit
         except Exception as exc:
             _log(f"LOI khoi dong lai: {exc}")
             self._write_log(update_log, log_lines)
-            return True, f"Cập nhật xong! Vui lòng mở lại ứng dụng thủ công."
+            return True, "Cập nhật xong! Vui lòng mở lại ứng dụng thủ công."
 
         return True, "Cập nhật thành công! Đang khởi động lại ứng dụng..."
 

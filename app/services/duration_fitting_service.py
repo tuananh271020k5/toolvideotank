@@ -35,9 +35,13 @@ def _resolve_ffmpeg() -> str:
     if w:
         return w
 
-    local_fallback = os.path.join(r"d:\capcap\CapCap", "bin", "ffmpeg", "ffmpeg.exe")
-    if os.path.isfile(local_fallback):
-        return local_fallback
+    try:
+        from app.runtime_paths import join_root
+        local_fallback = join_root("bin", "ffmpeg", "ffmpeg.exe")
+        if os.path.isfile(local_fallback):
+            return local_fallback
+    except Exception:
+        pass
 
     return "ffmpeg"
 
@@ -57,6 +61,12 @@ class FittedAudioResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# Dubbed speech is kept at 24 kHz.  16 kHz (the ASR rate) cuts everything
+# above 8 kHz, which is where Vietnamese fricatives such as "kh", "tr", "s"
+# and "x" live, making Piper/VieNeu/Edge voices sound muffled.
+DUB_SAMPLE_RATE = "24000"
 
 
 class DurationFittingService:
@@ -158,7 +168,7 @@ class DurationFittingService:
                     "-y",
                     "-i", raw_audio_path,
                     "-filter:a", "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-42dB",
-                    "-ar", "16000",
+                    "-ar", DUB_SAMPLE_RATE,
                     "-ac", "1",
                     target_output,
                 ]
@@ -222,7 +232,7 @@ class DurationFittingService:
             "-y",
             "-i", raw_audio_path,
             "-filter:a", filter_chain,
-            "-ar", "16000",
+            "-ar", DUB_SAMPLE_RATE,
             "-ac", "1",
             target_output,
         ]

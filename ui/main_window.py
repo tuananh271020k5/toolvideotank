@@ -587,6 +587,8 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
 
         self._deferred_startup_stage1_done = False
         self._deferred_startup_stage2_done = False
+        self.live_preview_segments = []
+        self.live_preview_editor_name = ""
 
         self.setup_ui()
         self._configure_local_voice_mode_ui()
@@ -617,8 +619,13 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
         dlg = UpdateDialog(self, workspace_root=root, mandatory=is_mand, preloaded_info=info)
         dlg.exec()
 
+    def open_video_cutter_dialog(self):
+        from ui.dialogs.video_cutter_dialog import VideoCutterDialog
+        vpath = getattr(self, "video_path", None)
+        dlg = VideoCutterDialog(self, video_path=vpath)
+        dlg.exec()
+
     def check_update_quietly(self):
-        import threading
         def _bg():
             try:
                 from app.services.update_service import UpdateService
@@ -818,7 +825,7 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
             margin = 4 if compact_height else 4
             root_layout.setContentsMargins(margin, margin, margin, margin)
             root_layout.setSpacing(4 if compact_height else 4)
-        if content_layout is not None:
+        if content_layout is not None and hasattr(content_layout, "setSpacing"):
             content_layout.setSpacing(4 if compact_width else 4)
         if header_layout is not None:
             header_layout.setContentsMargins(8 if compact_width else 10, 4 if compact_height else 4,
@@ -1212,7 +1219,6 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
         """
 
     def _vietdict_add_row(self, table):
-        from PySide6.QtWidgets import QTableWidgetItem
         r = table.rowCount()
         table.insertRow(r)
         table.setItem(r, 0, QTableWidgetItem(""))
@@ -2246,8 +2252,9 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
         if viewport_width <= 0:
             return
         gutter = 10
-        target_width = max(320, viewport_width - gutter)
+        target_width = max(260, viewport_width - gutter)
         container.setMaximumWidth(target_width)
+        container.setMinimumWidth(target_width)
 
     def eventFilter(self, watched, event):
         if event.type() in (QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
@@ -4065,7 +4072,7 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
                     previous_boundary = max(previous_boundary, boundary)
                 else:
                     next_boundary = boundary if next_boundary is None else min(next_boundary, boundary)
-            if start_s <= position_seconds <= end_s:
+            if start_s <= position_seconds < end_s:
                 result.append(idx)
         stable_start = previous_boundary
         stable_end = next_boundary if next_boundary is not None else float("inf")
@@ -4132,11 +4139,14 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
         v_ok = bool(self.video_path_edit.text().strip()) and os.path.exists(self.video_path_edit.text().strip())
         if hasattr(self, "voice_gender_check_btn"):
             worker = getattr(self, "_voice_gender_check_worker", None)
-            self.voice_gender_check_btn.setEnabled(v_ok and not (worker and worker.isRunning()))
+            is_running = bool((worker and worker.isRunning()) or getattr(self, "_voice_gender_progress_dialog", None))
+            self.voice_gender_check_btn.setEnabled(not is_running)
         if hasattr(self, "voice_gender_history_btn"):
-            self.voice_gender_history_btn.setEnabled(v_ok)
+            self.voice_gender_history_btn.setEnabled(True)
         if hasattr(self, "pipeline_b_create_btn"):
             self.pipeline_b_create_btn.setEnabled(True)
+        if hasattr(self, "smart_pipeline_btn"):
+            self.smart_pipeline_btn.setEnabled(True)
         a_ok = bool(self.audio_source_edit.text().strip()) and os.path.exists(self.audio_source_edit.text().strip())
         has_translated_text = bool(self.translated_text.toPlainText().strip())
         translation_ready = self._translation_phase_complete()
@@ -4424,7 +4434,6 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
             full_menu.addAction(fresh_action)
             btn.setMenu(menu)
             btn.setPopupMode(QToolButton.MenuButtonPopup)
-            btn.clicked.connect(self.run_all_pipeline)
             btn.setText("▶ Tạo video (1 giọng)")
 
             self._generate_transcript_action = transcript_action
@@ -4715,6 +4724,15 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
 
     def run_all_pipeline(self):
         """Kích hoạt quy trình 1 giọng tự động: Setup âm thanh ➔ Quét OCR ➔ DeepSeek AI ➔ Che chữ Trung + Đè phụ đề ➔ Ra video."""
+        if getattr(self, "_single_voice_setup_active", False):
+            return
+        self._single_voice_setup_active = True
+        try:
+            self._run_all_pipeline_impl()
+        finally:
+            self._single_voice_setup_active = False
+
+    def _run_all_pipeline_impl(self):
         video_path = self._normalize_local_file_path(
             self.video_path_edit.text().strip() if hasattr(self, "video_path_edit") else ""
         )
@@ -4722,6 +4740,17 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Chạy toàn bộ quy trình", "Vui lòng chọn hoặc kéo thả một tệp video trước.")
             return
+
+        norm_v = os.path.normpath(video_path) if video_path else ""
+
+        # Nếu người dùng đang chọn chế độ 2 Khung OCR -> chuyển sang quy trình 2 Khung OCR
+        cur_box_mode = 1
+        if hasattr(self, "ocr_box_mode_combo") and self.ocr_box_mode_combo:
+            cur_box_mode = self.ocr_box_mode_combo.currentData() or 1
+        elif hasattr(self, "_video_ocr_box_modes") and norm_v:
+            cur_box_mode = self._video_ocr_box_modes.get(norm_v, 1)
+        if cur_box_mode == 2 and hasattr(self, "start_dual_ocr_single_voice_flow"):
+            return self.start_dual_ocr_single_voice_flow()
 
         # 1. Tự động lấy khung che chữ Trung từ vùng OCR người dùng đã quét trên video
         blur_rect = None
@@ -4796,8 +4825,10 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
         burn_subs = dialog.is_burn_subtitles_enabled()
         sub_cfg = dialog.get_subtitle_config()
         brand_logo_settings = dialog.get_brand_logo_settings()
+        frame_border_settings = dialog.get_frame_border_settings()
         watermark_settings = dialog.get_watermark_settings()
         delogo_settings = dialog.get_delogo_settings()
+        asr_supplement_settings = dialog.get_asr_supplement_settings()
 
         # 3. Kiểm tra bản quyền VIP nếu chọn giọng VieNeu
         v_id = selected_voice.get("id", "")
@@ -4870,6 +4901,13 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
         # 6. Kiểm tra các câu đã quét trước đó nếu có
         existing_cues = []
         raw_segs = getattr(self, "current_segments", None) or getattr(self, "current_translated_segments", None)
+        # Cues written back by a previous 1-voice run are pipeline output,
+        # not user-prepared cues: reusing them would carry stale (or another
+        # video's) subtitles into this run.  Rescan instead.
+        pipeline_lists = getattr(self, "_pipeline_synced_segment_lists", ()) or ()
+        if raw_segs is not None and any(raw_segs is lst for lst in pipeline_lists):
+            self.log("[Pipeline 1 Giọng] Bỏ qua phụ đề của lần chạy trước, quét OCR lại từ đầu.")
+            raw_segs = None
         if raw_segs and isinstance(raw_segs, list):
             for s in raw_segs:
                 if isinstance(s, dict) and s.get("text"):
@@ -4890,13 +4928,16 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
             enable_blur_mask=enable_blur,
             mask_mode=dialog.get_mask_mode(),
             blur_rect=dialog.get_blur_rect() or blur_rect,
+            dynamic_mask=True,
             burn_subtitles=burn_subs,
             existing_cues=existing_cues if existing_cues else None,
             output_video_path=output_video_path,
             subtitle_config=sub_cfg,
             brand_logo_settings=brand_logo_settings,
+            frame_border_settings=frame_border_settings,
             watermark_settings=watermark_settings,
             delogo_settings=delogo_settings,
+            asr_supplement_settings=asr_supplement_settings,
         )
         progress_dlg.exec()
 
@@ -4907,6 +4948,10 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
             self.log(f"[Pipeline 1 Giọng] Đã xuất video hoàn chỉnh thành công: {final_mp4}")
             try:
                 from PySide6.QtCore import QUrl
+                self._preview_video_has_burned_subtitles = bool(burn_subs)
+                if burn_subs and hasattr(self, "video_view") and hasattr(self.video_view, "subtitle_item"):
+                    self.video_view.subtitle_item.set_text("")
+                    self.video_view.subtitle_item.hide()
                 self.media_player.setSource(QUrl.fromLocalFile(final_mp4))
                 self.video_path_edit.setText(final_mp4)
                 self.play_btn.setText("Play")
@@ -4944,6 +4989,7 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
                     self.current_translated_segments = trans_segs
                     if base_segs:
                         self.current_segments = base_segs
+                    self._pipeline_synced_segment_lists = (trans_segs, base_segs)
                     if hasattr(self, "timeline") and hasattr(self.timeline, "set_segments"):
                         self.timeline.set_segments(trans_segs)
                     if hasattr(self, "subtitle_list_view") and hasattr(self.subtitle_list_view, "refresh_segments"):
@@ -4951,6 +4997,264 @@ class VideoTranslatorGUI(QMainWindow, VoiceGenderMixin, ProjectSettingsMixin, Vi
                 except Exception:
                     pass
 
+    def start_dual_ocr_single_voice_flow(self):
+        """Kích hoạt quy trình Tạo video 2 Khung OCR (1 Giọng duy nhất):
+        1. Nhận diện đồng thời 2 khung OCR (Khung 1 ở đáy & Khung 2 ở đỉnh) trên video player.
+        2. Mở hộp thoại chọn 1 giọng đọc AI & thiết lập âm thanh/phụ đề.
+        3. Quét OCR độc lập cả 2 vùng trên từng frame.
+        4. Dịch thuật theo ngữ cảnh văn bản bằng DeepSeek AI.
+        5. Sinh giọng đọc 1 giọng duy nhất (TTS).
+        6. Xuất video MP4: Chữ ở khung OCR nào xuất hiện thì chỉ làm mặt nạ che mờ động ở khung đó vào đúng thời điểm đó, hết chữ mặt nạ biến mất 100%!
+        """
+        if getattr(self, "_dual_ocr_flow_active", False):
+            return
+        self._dual_ocr_flow_active = True
+        try:
+            self._start_dual_ocr_single_voice_flow_impl()
+        finally:
+            self._dual_ocr_flow_active = False
+
+    def _start_dual_ocr_single_voice_flow_impl(self):
+        video_path = self._normalize_local_file_path(
+            self.video_path_edit.text().strip() if hasattr(self, "video_path_edit") else ""
+        )
+        if not video_path or not os.path.isfile(video_path):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Tạo video 2 Khung OCR", "Vui lòng chọn hoặc kéo thả một tệp video trước.")
+            return
+
+        # 1. Bật hiển thị 2 khung OCR trên màn hình xem video preview nếu đang ẩn
+        ov = getattr(self, "ocr_region_overlay", None)
+        if not ov and hasattr(self, "preview_panel"):
+            ov = getattr(self.preview_panel, "ocr_region_overlay", None)
+        if ov:
+            try:
+                if hasattr(ov, "set_box_mode"):
+                    ov.set_box_mode(2)
+                ov._main_window = self
+                ov._requested_visible = True
+                ov.set_editable(True)
+                ov.show()
+                ov.raise_()
+                ov.sync_to_view()
+                ov.update()
+                btn = getattr(self, "ocr_region_btn", None)
+                if btn:
+                    btn.blockSignals(True)
+                    btn.setChecked(True)
+                    btn.setStyleSheet("QPushButton { color: #ffb450; font-weight: bold; font-size: 10px; padding: 0; border: none; }")
+                    btn.blockSignals(False)
+                combo = getattr(self, "ocr_box_mode_combo", None)
+                if combo:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(1)  # 2 Khung OCR
+                    combo.blockSignals(False)
+                save_btn = getattr(self, "ocr_save_btn", None)
+                if save_btn:
+                    save_btn.setVisible(True)
+            except Exception:
+                pass
+
+        # 2. Lấy tọa độ 2 khung OCR (Khung 1 - Đáy và Khung 2 - Đỉnh)
+        rect1 = None
+        rect2 = None
+        if ov and hasattr(ov, "get_dual_norm_rects"):
+            rect1, rect2 = ov.get_dual_norm_rects()
+        elif ov and hasattr(ov, "get_norm_rect"):
+            rect1 = ov.get_norm_rect()
+
+        norm_v = os.path.normpath(video_path) if video_path else ""
+        if (not rect1 or rect1[2] <= 0.01 or rect1[3] <= 0.01) and hasattr(self, "_video_ocr_rects") and norm_v in self._video_ocr_rects:
+            rect1 = self._video_ocr_rects[norm_v]
+        if not rect1 or rect1[2] <= 0.01 or rect1[3] <= 0.01:
+            r1_env = os.getenv("OCR_SUBTITLE_RECT", "")
+            if r1_env:
+                try:
+                    parts = [float(p) for p in r1_env.split(",")[:4]]
+                    if len(parts) == 4 and parts[2] > 0.01:
+                        rect1 = tuple(parts)
+                except Exception:
+                    pass
+        if not rect1:
+            rect1 = (0.08, 0.70, 0.84, 0.09)
+
+        if (not rect2 or rect2[2] <= 0.01 or rect2[3] <= 0.01) and hasattr(self, "_video_ocr_rects_2") and norm_v in self._video_ocr_rects_2:
+            rect2 = self._video_ocr_rects_2[norm_v]
+        if not rect2 or rect2[2] <= 0.01 or rect2[3] <= 0.01:
+            r2_env = os.getenv("OCR_SUBTITLE_RECT_2", "")
+            if r2_env:
+                try:
+                    parts = [float(p) for p in r2_env.split(",")[:4]]
+                    if len(parts) == 4 and parts[2] > 0.01:
+                        rect2 = tuple(parts)
+                except Exception:
+                    pass
+        if not rect2:
+            rect2 = (0.08, 0.09, 0.84, 0.085)
+
+        self.log(f"[Tạo video 2 Khung OCR] Khung 1 (Đáy): {rect1} | Khung 2 (Đỉnh): {rect2}")
+
+        # 3. Mở bảng Setup âm thanh & chọn 1 giọng lồng tiếng duy nhất
+        from ui.dialogs.single_voice_setup_dialog import SingleVoiceSetupDialog
+        init_orig = int(self.audio_a1_volume_slider.value()) if hasattr(self, "audio_a1_volume_slider") else 50
+        init_tts = int(self.audio_a2_volume_slider.value()) if hasattr(self, "audio_a2_volume_slider") else 100
+        dialog = SingleVoiceSetupDialog(
+            self,
+            video_path=video_path,
+            initial_orig_volume=init_orig,
+            initial_tts_volume=init_tts,
+            blur_rect=rect1,
+            workspace_root=str(getattr(self, "workspace_root", os.getcwd())),
+        )
+        dialog.setWindowTitle("Cài đặt tạo video 2 Khung OCR (1 Giọng duy nhất)")
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        selected_voice = dialog.get_selected_voice()
+        audio_mix = dialog.get_audio_mix_settings()
+        enable_blur = dialog.is_blur_mask_enabled()
+        burn_subs = dialog.is_burn_subtitles_enabled()
+        sub_cfg = dialog.get_subtitle_config()
+        brand_logo_settings = dialog.get_brand_logo_settings()
+        frame_border_settings = dialog.get_frame_border_settings()
+        watermark_settings = dialog.get_watermark_settings()
+        delogo_settings = dialog.get_delogo_settings()
+        asr_supplement_settings = dialog.get_asr_supplement_settings()
+
+        # 4. Kiểm tra bản quyền VIP nếu chọn giọng VieNeu
+        v_id = selected_voice.get("id", "")
+        if "vieneu" in selected_voice.get("provider", "") or "vieneu" in v_id:
+            from app.services.license_service import LicenseService
+            lic = LicenseService(str(getattr(self, "workspace_root", os.getcwd())))
+            is_valid, msg = lic.is_license_valid()
+            if not is_valid:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "Yêu cầu kích hoạt bản quyền VIP",
+                    f"Giọng {selected_voice.get('name')} yêu cầu kích hoạt bản quyền VIP TankVideo!\n\n"
+                    f"Trạng thái: {msg}\n\n"
+                    "Vui lòng nhấn vào nút 'Bản quyền' trên thanh tiêu đề để đăng nhập và kích hoạt.",
+                )
+                getattr(self, "open_license_dialog", lambda: None)()
+                return
+
+        # 5. Đồng bộ thanh trượt âm lượng
+        orig_vol = audio_mix.get("original_volume", 0.50)
+        tts_vol = audio_mix.get("tts_volume", 1.00)
+        if hasattr(self, "audio_a1_volume_slider"):
+            self.audio_a1_volume_slider.blockSignals(True)
+            self.audio_a1_volume_slider.setValue(int(round(orig_vol * 100)))
+            self.audio_a1_volume_slider.blockSignals(False)
+            if hasattr(self, "audio_a1_volume_label"):
+                self.audio_a1_volume_label.setText(f"{int(round(orig_vol * 100))}%")
+        if hasattr(self, "audio_a2_volume_slider"):
+            self.audio_a2_volume_slider.blockSignals(True)
+            self.audio_a2_volume_slider.setValue(int(round(tts_vol * 100)))
+            self.audio_a2_volume_slider.blockSignals(False)
+            if hasattr(self, "audio_a2_volume_label"):
+                self.audio_a2_volume_label.setText(f"{int(round(tts_vol * 100))}%")
+
+        if getattr(dialog, "save_only", False) or not getattr(dialog, "start_now", False):
+            return
+
+        # 6. Đường dẫn file video xuất ra
+        output_folder = (
+            self.final_output_folder_edit.text().strip()
+            if hasattr(self, "final_output_folder_edit") and self.final_output_folder_edit.text().strip()
+            else os.path.join(str(self.workspace_root), "output")
+        )
+        os.makedirs(output_folder, exist_ok=True)
+        video_name = os.path.splitext(os.path.basename(video_path))[0] if video_path else "video"
+        output_video_path = os.path.join(output_folder, f"{video_name}_dual_ocr_vi.mp4")
+
+        # 7. Mở dialog tiến trình trực quan thực hiện toàn bộ quy trình 2 khung OCR
+        from ui.dialogs.single_voice_progress_dialog import SingleVoiceProgressDialog
+        progress_dlg = SingleVoiceProgressDialog(
+            self,
+            workspace_root=str(self.workspace_root),
+            video_path=video_path,
+            selected_voice=selected_voice,
+            audio_mix_settings=audio_mix,
+            enable_blur_mask=enable_blur,
+            mask_mode="blur",
+            blur_rect=rect1,
+            blur_rect_2=rect2,
+            is_dual_ocr=True,
+            dynamic_mask=True,
+            burn_subtitles=burn_subs,
+            existing_cues=None,
+            output_video_path=output_video_path,
+            subtitle_config=sub_cfg,
+            brand_logo_settings=brand_logo_settings,
+            frame_border_settings=frame_border_settings,
+            watermark_settings=watermark_settings,
+            delogo_settings=delogo_settings,
+            asr_supplement_settings=asr_supplement_settings,
+        )
+        progress_dlg.exec()
+
+        # 8. Cập nhật kết quả sau khi hoàn thành
+        res = getattr(progress_dlg, "_last_result", None)
+        if res and getattr(res, "output_video_path", "") and os.path.isfile(res.output_video_path):
+            final_mp4 = os.path.abspath(res.output_video_path)
+            self.log(f"[Tạo video 2 Khung OCR] Đã xuất video hoàn chỉnh thành công: {final_mp4}")
+            try:
+                from PySide6.QtCore import QUrl
+                self._preview_video_has_burned_subtitles = bool(burn_subs)
+                if burn_subs and hasattr(self, "video_view") and hasattr(self.video_view, "subtitle_item"):
+                    self.video_view.subtitle_item.set_text("")
+                    self.video_view.subtitle_item.hide()
+                self.media_player.setSource(QUrl.fromLocalFile(final_mp4))
+                self.video_path_edit.setText(final_mp4)
+                self.play_btn.setText("Play")
+            except Exception:
+                pass
+
+            trans_cues = getattr(progress_dlg, "_translated_cues", [])
+            if trans_cues:
+                try:
+                    trans_segs = []
+                    base_segs = []
+                    for c in trans_cues:
+                        if not isinstance(c, dict):
+                            continue
+                        s_s = float(c.get("start", 0.0))
+                        e_s = float(c.get("end", 0.0))
+                        t_txt = str(c.get("translated_text", "") or c.get("translated", "")).strip()
+                        o_txt = str(c.get("source_text", "") or c.get("original", "") or c.get("text", "")).strip()
+                        b_idx = int(c.get("ocr_box_index", 2 if str(c.get("position", "")).lower() == "top" else 1) or 1)
+                        pos = str(c.get("position", "top" if b_idx == 2 else "bottom")).lower()
+                        trans_segs.append({
+                            "start": s_s,
+                            "end": e_s,
+                            "text": t_txt,
+                            "translated": t_txt,
+                            "translated_text": t_txt,
+                            "original": o_txt,
+                            "source_text": o_txt,
+                            "ocr_box_index": b_idx,
+                            "position": pos,
+                        })
+                        base_segs.append({
+                            "start": s_s,
+                            "end": e_s,
+                            "text": o_txt,
+                            "original": o_txt,
+                            "source_text": o_txt,
+                            "ocr_box_index": b_idx,
+                            "position": pos,
+                        })
+                    self.current_translated_segments = trans_segs
+                    if base_segs:
+                        self.current_segments = base_segs
+                    self._pipeline_synced_segment_lists = (trans_segs, base_segs)
+                    if hasattr(self, "timeline") and hasattr(self.timeline, "set_segments"):
+                        self.timeline.set_segments(trans_segs)
+                    if hasattr(self, "subtitle_list_view") and hasattr(self.subtitle_list_view, "refresh_segments"):
+                        self.subtitle_list_view.refresh_segments()
+                except Exception:
+                    pass
 
     def run_fresh_pipeline(self):
         """Force a fresh pipeline run by clearing cached transcription and subtitle artifacts."""

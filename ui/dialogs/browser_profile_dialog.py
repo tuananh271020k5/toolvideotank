@@ -9,12 +9,10 @@ Cung cấp giao diện hiện đại phong cách Cyberpunk:
    hướng dẫn chi tiết cách lấy lại cookie qua tiện ích ATP Cookie và hỗ trợ dán nhanh từ clipboard.
 """
 
-import os
-import sys
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
-from PySide6.QtCore import Qt, Signal, QSettings
-from PySide6.QtGui import QColor, QFont, QCursor
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -159,13 +157,13 @@ class BrowserProfileDialog(QDialog):
         # Top row in Page 1: Back button + title
         p_nav_row = QHBoxLayout()
         btn_back = QPushButton("⬅️ Chọn Trình Duyệt Khác")
-        btn_back.setStyleSheet(f"""
-            QPushButton {{
+        btn_back.setStyleSheet("""
+            QPushButton {
                 background: #1e293b; border: 1px solid #334155;
                 border-radius: 6px; color: #cbd5e1; font-size: 11px; font-weight: 700;
                 padding: 6px 12px;
-            }}
-            QPushButton:hover {{ background: #334155; color: white; }}
+            }
+            QPushButton:hover { background: #334155; color: white; }
         """)
         btn_back.clicked.connect(lambda: self._switch_to_browsers_page())
         p_nav_row.addWidget(btn_back)
@@ -455,13 +453,13 @@ class BrowserProfileDialog(QDialog):
 
         btn_select = QPushButton("Chọn")
         btn_select.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_select.setStyleSheet(f"""
-            QPushButton {{
+        btn_select.setStyleSheet("""
+            QPushButton {
                 background: #1e293b; border: 1px solid #334155;
                 border-radius: 6px; color: #cbd5e1; font-size: 11px; font-weight: 700;
                 padding: 6px 14px;
-            }}
-            QPushButton:hover {{ background: #334155; color: white; }}
+            }
+            QPushButton:hover { background: #334155; color: white; }
         """)
         btn_select.clicked.connect(lambda: self._on_profile_selected({"id": "new_session", "name": "Phiên Độc Lập"}))
         lay.addWidget(btn_select)
@@ -536,13 +534,13 @@ class CookieExpiredDialog(QDialog):
 
         # Header with warning badge
         header_card = QFrame(self)
-        header_card.setStyleSheet(f"""
-            QFrame {{
+        header_card.setStyleSheet("""
+            QFrame {
                 background: #1c0a0e;
                 border: 1px solid #7f1d1d;
                 border-radius: 10px;
                 padding: 4px;
-            }}
+            }
         """)
         h_layout = QHBoxLayout(header_card)
         h_layout.setContentsMargins(14, 12, 14, 12)

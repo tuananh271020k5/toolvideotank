@@ -10,7 +10,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Callable
+from typing import Any
 
 try:
     from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APITimeoutError

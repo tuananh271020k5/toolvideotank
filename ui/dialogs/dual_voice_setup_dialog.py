@@ -7,21 +7,18 @@ speech speed, audio ducking, subtitle burning, and blur masking for selected bat
 from __future__ import annotations
 
 import os
-import re
 from typing import Any
 
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -29,7 +26,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.services.video_export_service import SubtitleRenderConfig
 from ui.dialogs.select_master_dialog import (
     AVAILABLE_FEMALE_VOICES,
     AVAILABLE_MALE_VOICES,

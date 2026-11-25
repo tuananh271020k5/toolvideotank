@@ -6,16 +6,15 @@ except ImportError:
     from ui.main_window_parts.common_deps import *
 
 
-from typing import Any, Dict, List, Optional
 import os
 import json
 import logging
 
-from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QTimer
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QPushButton, QSlider, QProgressBar, QLabel, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox, QTabWidget, QSplitter, QScrollArea, QFrame, QDialog,
-    QApplication, QFileDialog, QMessageBox, QWidget, QMenu
+    QPushButton, QLabel, QComboBox, QHBoxLayout, QVBoxLayout, QScrollArea, QFrame, QDialog,
+    QApplication, QMessageBox, QWidget
 )
 
 logger = logging.getLogger(__name__)

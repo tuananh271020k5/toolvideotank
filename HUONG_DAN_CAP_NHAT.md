@@ -25,7 +25,7 @@ Trước khi build, hãy chắc chắn bạn đã đóng cửa sổ `TankVideo.e
 ---
 
 ### 🔹 Bước 3: Đóng gói lại file `TankVideo.exe` mới
-Mở PowerShell hoặc Command Prompt tại thư mục dự án `D:\capcap\CapCap` và chạy lệnh:
+Mở PowerShell hoặc Command Prompt tại thư mục dự án `D:\tankvideo\tankvideo` và chạy lệnh:
 ```bash
 .\.venv\Scripts\pyinstaller.exe CapCap.spec --noconfirm
 ```

@@ -12,7 +12,6 @@ kết hợp 5 nguồn tín hiệu độc lập:
 
 from __future__ import annotations
 
-import re
 from typing import Any, List, Dict, Optional, Tuple
 
 
@@ -285,8 +284,8 @@ class DecisionFusionService:
                     final_c = round(raw_c, 3)
                     mode = "acoustic_tiebreak"
                     reasons.append("Phân xử hòa điểm: Ưu tiên âm học vật lý đáng tin cậy")
-                elif dg in {"male", "female"}:
-                    final_g = dg
+                elif lg in {"male", "female"}:
+                    final_g = lg
                     final_c = 0.60
                     mode = "deepseek_tiebreak"
                     reasons.append("Phân xử hòa điểm: Ưu tiên DeepSeek ngữ cảnh kịch bản")

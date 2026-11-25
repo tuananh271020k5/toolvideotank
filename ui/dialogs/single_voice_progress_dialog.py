@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -41,7 +40,6 @@ from app.services.video_creator_service import (
     VideoCreatorService,
 )
 from app.services.video_export_service import SubtitleRenderConfig
-from app.services.voice_mapping_service import VoiceMappingConfig
 
 
 class SingleVoicePipelineWorker(QThread):
@@ -52,6 +50,7 @@ class SingleVoicePipelineWorker(QThread):
     log_emitted = Signal(str)
     pipeline_finished = Signal(object, list)  # (VideoCreatorResult, translated_cues)
     pipeline_error = Signal(str)
+    pipeline_cancelled = Signal()
 
     def __init__(
         self,
@@ -68,10 +67,15 @@ class SingleVoicePipelineWorker(QThread):
         output_video_path: str,
         subtitle_config: SubtitleRenderConfig | None = None,
         brand_logo_settings: dict[str, Any] | None = None,
+        frame_border_settings: dict[str, Any] | None = None,
         watermark_settings: dict[str, Any] | None = None,
         delogo_settings: dict[str, Any] | None = None,
         dual_voice_config: dict[str, Any] | None = None,
         approved_cues: list[dict[str, Any]] | None = None,
+        blur_rect_2: tuple[float, float, float, float] | None = None,
+        is_dual_ocr: bool = False,
+        dynamic_mask: bool = False,
+        asr_supplement_settings: dict[str, Any] | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -83,27 +87,48 @@ class SingleVoicePipelineWorker(QThread):
         self.subtitle_config = subtitle_config or SubtitleRenderConfig()
         self.mask_mode = str(mask_mode or getattr(self.subtitle_config, "mask_mode", "box") or "box").strip().lower()
         self.blur_rect = blur_rect
+        self.blur_rect_2 = blur_rect_2
+        self.is_dual_ocr = is_dual_ocr
+        self.dynamic_mask = dynamic_mask
         self.burn_subtitles = burn_subtitles
         self.existing_cues = existing_cues
         self.output_video_path = output_video_path
         self.brand_logo_settings = brand_logo_settings or {}
+        self.frame_border_settings = frame_border_settings or {}
         self.watermark_settings = watermark_settings or {}
         self.delogo_settings = delogo_settings or {}
         self.dual_voice_config = dual_voice_config
         self.approved_cues = approved_cues
+        self.asr_supplement_settings = asr_supplement_settings or {}
 
         self._cancel_event = threading.Event()
 
     def request_cancel(self) -> None:
         self._cancel_event.set()
 
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
     def run(self):
         try:
+            from runtime_paths import optimize_windows_performance
+            optimize_windows_performance()
+        except Exception:
+            pass
+        try:
             self._execute_pipeline()
+        except InterruptedError:
+            self.pipeline_cancelled.emit()
         except Exception as exc:
+            if self._cancel_event.is_set():
+                self.pipeline_cancelled.emit()
+                return
             trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
             print(f"[SingleVoicePipelineWorker] Error:\n{trace_str}")
             self.pipeline_error.emit(str(exc))
+        else:
+            if self._cancel_event.is_set():
+                self.pipeline_cancelled.emit()
 
     def _execute_pipeline(self):
         translated_cues: list[dict[str, Any]] = []
@@ -119,15 +144,78 @@ class SingleVoicePipelineWorker(QThread):
             self.stage_changed.emit("ocr", "Đang quét phụ đề video (OCR)...")
             self.progress_updated.emit(5.0, "Đang quét phụ đề video...")
 
+            # Trích xuất các khoảng thời gian phân cảnh tin nhắn / ASR nếu có
+            asr_enabled = bool(self.asr_supplement_settings.get("enabled"))
+            asr_mode = str(self.asr_supplement_settings.get("mode", "range") or "range").lower()
+            asr_ranges: list[tuple[float, float]] = []
+            if asr_enabled and asr_mode == "range":
+                for r in self.asr_supplement_settings.get("ranges") or []:
+                    if isinstance(r, (list, tuple)) and len(r) >= 2 and float(r[1]) > float(r[0]):
+                        asr_ranges.append((round(float(r[0]), 2), round(float(r[1]), 2)))
+                if not asr_ranges:
+                    s_s = max(0.0, float(self.asr_supplement_settings.get("start_seconds", 0.0) or 0.0))
+                    e_s = float(self.asr_supplement_settings.get("end_seconds", 0.0) or 0.0)
+                    if e_s > s_s:
+                        asr_ranges.append((round(s_s, 2), round(e_s, 2)))
+
+            def _is_in_asr_range(c_start: float, c_end: float) -> bool:
+                for r_s, r_e in asr_ranges:
+                    overlap = max(0.0, min(c_end, r_e) - max(c_start, r_s))
+                    c_dur = max(0.1, c_end - c_start)
+                    if (r_s <= c_start < r_e) or (r_s < c_end <= r_e) or (overlap / c_dur >= 0.35) or (overlap > 0.8):
+                        return True
+                return False
+
             cues: list[dict[str, Any]] = []
             if self.existing_cues and len(self.existing_cues) > 0 and any(str(c.get("text", "")).strip() for c in self.existing_cues):
-                cues = [dict(c) for c in self.existing_cues if str(c.get("text", "")).strip()]
-                self.log_emitted.emit(f"[OCR] Tái sử dụng {len(cues)} câu phụ đề đã nhận diện trên giao diện.")
+                raw_existing = [dict(c) for c in self.existing_cues if str(c.get("text", "")).strip()]
+                if asr_ranges:
+                    cues = [c for c in raw_existing if not _is_in_asr_range(float(c.get("start", 0.0)), float(c.get("end", 0.0)))]
+                    rem_cnt = len(raw_existing) - len(cues)
+                    range_desc = ", ".join(f"{s}s-{e}s" for s, e in asr_ranges)
+                    self.log_emitted.emit(f"[OCR] Tái sử dụng {len(cues)} câu phụ đề (đã loại bỏ {rem_cnt} câu OCR dính trong khoảng thời gian tin nhắn ASR: {range_desc}).")
+                else:
+                    cues = raw_existing
+                    self.log_emitted.emit(f"[OCR] Tái sử dụng {len(cues)} câu phụ đề đã nhận diện trên giao diện.")
+            elif self.is_dual_ocr or self.blur_rect_2:
+                self.log_emitted.emit(f"[OCR 2 Khung] Bắt đầu quét đồng thời 2 khung OCR trên video: {os.path.basename(self.video_path)}")
+                from app.ocr_processor import transcribe_video_dual_ocr
+                from services.subtitle_merge_service import SubtitleMergeService
+
+                r1 = self.blur_rect or (0.08, 0.70, 0.84, 0.09)
+                r2 = self.blur_rect_2 or (0.08, 0.09, 0.84, 0.085)
+                os.environ["OCR_SUBTITLE_RECT"] = f"{r1[0]},{r1[1]},{r1[2]},{r1[3]}"
+                os.environ["OCR_SUBTITLE_RECT_2"] = f"{r2[0]},{r2[1]},{r2[2]},{r2[3]}"
+
+                def _on_ocr_progress(cur, total, ocr_cnt, skip_cnt):
+                    if self._cancel_event.is_set():
+                        return
+                    if total > 0:
+                        pct = 5.0 + (cur / total) * 20.0
+                        p_int = cur * 100 // total
+                        msg = f"Đang quét 2 Khung OCR: Frame {cur}/{total} ({p_int}%) - Đã tìm thấy {ocr_cnt} câu..."
+                        self.progress_updated.emit(pct, msg)
+                        self.log_emitted.emit(f"[Dual OCR] Frame {cur}/{total} ({p_int}%, OCR: {ocr_cnt}, skip: {skip_cnt})")
+
+                raw_cues = list(
+                    transcribe_video_dual_ocr(
+                        self.video_path,
+                        rect1=r1,
+                        rect2=r2,
+                        skip_ranges=asr_ranges,
+                        progress_callback=_on_ocr_progress,
+                        is_cancelled_func=lambda: self._cancel_event.is_set(),
+                    ) or []
+                )
+                self.log_emitted.emit(f"[Dual OCR] Quét 2 khung hoàn tất, tìm thấy {len(raw_cues)} câu thoại.")
+                cues = SubtitleMergeService.sanitize_cue_timings([dict(c) for c in raw_cues if str(c.get("text", "")).strip()])
             else:
                 self.log_emitted.emit(f"[OCR] Bắt đầu quét OCR từ video: {os.path.basename(self.video_path)}")
                 from services.engine_runtime import EngineRuntime
                 from services.subtitle_merge_service import SubtitleMergeService
 
+                if self.blur_rect and len(self.blur_rect) == 4 and self.blur_rect[2] > 0 and self.blur_rect[3] > 0:
+                    os.environ["OCR_SUBTITLE_RECT"] = f"{self.blur_rect[0]},{self.blur_rect[1]},{self.blur_rect[2]},{self.blur_rect[3]}"
                 engine = EngineRuntime()
                 region = str(os.getenv("OCR_SUBTITLE_REGION", "bottom") or "bottom")
 
@@ -141,14 +229,32 @@ class SingleVoicePipelineWorker(QThread):
                         self.progress_updated.emit(pct, msg)
                         self.log_emitted.emit(f"[OCR] Frame {cur}/{total} ({p_int}%, OCR: {ocr_cnt}, skip: {skip_cnt})")
 
-                raw_cues = list(engine.transcribe_video_ocr(self.video_path, region=region, progress_callback=_on_ocr_progress) or [])
+                raw_cues = list(
+                    engine.transcribe_video_ocr(
+                        self.video_path,
+                        region=region,
+                        skip_ranges=asr_ranges,
+                        progress_callback=_on_ocr_progress,
+                        is_cancelled_func=lambda: self._cancel_event.is_set(),
+                    ) or []
+                )
                 self.log_emitted.emit(f"[OCR] Quét thô hoàn tất, tìm thấy {len(raw_cues)} đoạn text.")
                 cues = SubtitleMergeService.merge_cues([dict(c) for c in raw_cues if str(c.get("text", "")).strip()])
+                cues = SubtitleMergeService.sanitize_cue_timings(cues)
+
+            # Lọc sạch các câu OCR rơi vào khoảng thời gian phân cảnh tin nhắn ASR
+            if asr_ranges and cues:
+                before_cnt = len(cues)
+                cues = [c for c in cues if not _is_in_asr_range(float(c.get("start", 0.0)), float(c.get("end", 0.0)))]
+                rem_cnt = before_cnt - len(cues)
+                if rem_cnt > 0:
+                    self.log_emitted.emit(f"[OCR] Đã loại bỏ triệt để {rem_cnt} đoạn text OCR rác trong khoảng thời gian tin nhắn ASR.")
 
             if self._cancel_event.is_set():
+                self.pipeline_cancelled.emit()
                 return
 
-            if not cues:
+            if not cues and not asr_enabled:
                 raise RuntimeError(
                     "Không đọc được phụ đề từ video. Vui lòng kiểm tra lại khung OCR trên màn hình xem video."
                 )
@@ -156,18 +262,43 @@ class SingleVoicePipelineWorker(QThread):
             self.log_emitted.emit(f"[OCR] Đã chuẩn hóa {len(cues)} câu thoại hợp lệ.")
             self.progress_updated.emit(25.0, f"Đã quét xong {len(cues)} câu phụ đề.")
 
+            # --- BƯỚC 1.5: QUÉT BỔ SUNG GIỌNG NÓI ASR CHO ĐOẠN TIN NHẮN / HỘI THOẠI KHÔNG CÓ SUB ---
+            if self.asr_supplement_settings.get("enabled"):
+                self.log_emitted.emit("[ASR Bổ sung] Đang quét giọng nói bổ sung cho các đoạn tin nhắn / hội thoại không có phụ đề chữ...")
+                supp_cues = self._run_asr_supplement(cues)
+                if supp_cues:
+                    cues.extend(supp_cues)
+                    cues = sorted(cues, key=lambda c: float(c.get("start", 0.0)))
+                    from services.subtitle_merge_service import SubtitleMergeService
+                    cues = SubtitleMergeService.sanitize_cue_timings(cues)
+                    self.log_emitted.emit(f"[ASR Bổ sung] Tổng số câu thoại sau khi hợp nhất: {len(cues)} câu.")
+
             if self.dual_voice_config:
                 # --- BƯỚC 2 (DUAL VOICE): NHẬN DIỆN GIỌNG NÓI & PHÂN VAI NAM/NỮ AI (25% -> 45%) ---
                 self.stage_changed.emit("gender", "Đang nhận diện giọng nói & phân vai Nam/Nữ AI...")
-                self.progress_updated.emit(28.0, "Đang nhận diện âm học và phân vai nhân vật...")
+                self.progress_updated.emit(26.0, "Đang nhận diện âm học và phân vai nhân vật...")
                 self.log_emitted.emit("[Phân vai AI] Bắt đầu phân tích âm học và kịch bản phân vai Nam/Nữ chuẩn (ASR + VAD + OCR)...")
                 from services.voice_gender_check_service import VoiceGenderCheckService
                 gender_svc = VoiceGenderCheckService()
+
+                def _on_gender_prog(pct_or_msg, maybe_msg=""):
+                    if isinstance(pct_or_msg, (int, float)):
+                        scaled = 25.0 + (float(pct_or_msg) * 0.20)
+                        msg_str = str(maybe_msg) if maybe_msg else "Đang phân vai AI..."
+                        self.progress_updated.emit(scaled, msg_str)
+                        self.log_emitted.emit(f"[Phân vai AI] {msg_str}")
+                    else:
+                        self.log_emitted.emit(f"[Phân vai AI] {pct_or_msg}")
+
                 gender_res = gender_svc.run(
                     self.video_path,
                     existing_cues=None,
-                    progress=lambda msg: self.log_emitted.emit(f"[Phân vai AI] {msg}"),
+                    progress=_on_gender_prog,
+                    is_cancelled_func=lambda: self._cancel_event.is_set(),
                 )
+                if self._cancel_event.is_set() or (isinstance(gender_res, dict) and gender_res.get("cancelled")):
+                    self.pipeline_cancelled.emit()
+                    return
                 translated_cues = gender_res.get("rows", [])
                 self.progress_updated.emit(45.0, f"Phân vai hoàn tất: {len(translated_cues)} câu thoại.")
             else:
@@ -177,6 +308,7 @@ class SingleVoicePipelineWorker(QThread):
                 from services.subtitle_translation_service import SubtitleTranslationService
 
                 cues = SubtitleMergeService.merge_incomplete_split_dialogues(cues)
+                cues = SubtitleMergeService.sanitize_cue_timings(cues)
                 # Đánh số ID cho các câu
                 indexed_cues = [
                     {**cue, "id": cue.get("id", idx)}
@@ -191,6 +323,8 @@ class SingleVoicePipelineWorker(QThread):
                         self.log_emitted.emit("[Dịch thuật] Đang kết nối DeepSeek AI API để dịch theo văn cảnh...")
 
                         def _on_ds_progress(msg, cur, tot):
+                            if self._cancel_event.is_set():
+                                return
                             if tot > 0:
                                 pct = 25.0 + (cur / tot) * 20.0
                                 self.progress_updated.emit(pct, f"DeepSeek AI đang dịch ({cur}/{tot})...")
@@ -207,6 +341,7 @@ class SingleVoicePipelineWorker(QThread):
                         translated_cues = []
 
                 if self._cancel_event.is_set():
+                    self.pipeline_cancelled.emit()
                     return
 
                 if not translated_cues:
@@ -248,8 +383,8 @@ class SingleVoicePipelineWorker(QThread):
                 if any(kw in orig_txt for kw in AD_NOISE_KEYWORDS) and (not trans_txt or bool(CHINESE_CHAR_RE.search(trans_txt))):
                     is_noise = True
                 has_chinese = bool(CHINESE_CHAR_RE.search(trans_txt))
-                skip_tts = bool(cue.get("skip_tts", False)) or is_noise or (not trans_txt) or has_chinese or (final_g == "none")
-                effective_trans = "" if skip_tts else trans_txt
+                skip_tts = bool(cue.get("skip_tts", False)) or is_noise or (not trans_txt) or has_chinese or (final_g in ("none", "unknown"))
+                effective_trans = "" if (is_noise or not trans_txt) else trans_txt
 
                 if final_g == "female":
                     v_id, v_nm = female_id, female_name
@@ -257,6 +392,12 @@ class SingleVoicePipelineWorker(QThread):
                     v_id, v_nm = male_id, male_name
                 else:
                     v_id, v_nm = (female_id, female_name) if "nữ" in female_name.lower() else (male_id, male_name)
+
+                c_meta = cue.get("metadata") if isinstance(cue.get("metadata"), dict) else {}
+                raw_box = cue.get("ocr_box_index") if cue.get("ocr_box_index") is not None else c_meta.get("ocr_box_index")
+                raw_pos = cue.get("position") or c_meta.get("position")
+                calc_box = int(raw_box if raw_box is not None else (2 if str(raw_pos or "").lower() == "top" else 1))
+                calc_pos = str(raw_pos or ("top" if calc_box == 2 else "bottom")).lower()
 
                 seg = SubtitleSegment(
                     id=idx,
@@ -271,12 +412,19 @@ class SingleVoicePipelineWorker(QThread):
                     is_noise=is_noise,
                     skip_tts=skip_tts,
                     bbox=cue.get("bbox", []) or [],
+                    ocr_box_index=calc_box,
+                    position=calc_pos,
                 )
                 segments.append(seg)
         else:
             voice_id = str(self.selected_voice.get("id", "adam1")).strip()
             voice_name = str(self.selected_voice.get("name", voice_id)).strip()
-            self.log_emitted.emit(f"[Lồng tiếng] Áp dụng giọng thuyết minh: {voice_name} (ID: {voice_id})")
+            is_no_voice = (voice_id in ("no_voiceover", "none", "no_voice") or str(self.selected_voice.get("provider", "")).lower() == "none")
+
+            if is_no_voice:
+                self.log_emitted.emit("[Chế độ Phụ đề] Người dùng chọn: KHÔNG LỒNG TIẾNG. Bỏ qua hoàn toàn bước sinh giọng đọc AI, giữ 100% âm thanh gốc của video.")
+            else:
+                self.log_emitted.emit(f"[Lồng tiếng] Áp dụng giọng thuyết minh: {voice_name} (ID: {voice_id})")
 
             for idx, cue in enumerate(translated_cues, start=1):
                 start_s = float(cue.get("start", 0.0) or 0.0)
@@ -288,12 +436,20 @@ class SingleVoicePipelineWorker(QThread):
                 if any(kw in orig_txt for kw in AD_NOISE_KEYWORDS) and (not trans_txt or bool(CHINESE_CHAR_RE.search(trans_txt))):
                     is_noise = True
 
-                # Kiểm tra nếu bản dịch rỗng HOẶC bản dịch vẫn chứa chữ Hán (chưa được dịch sang tiếng Việt)
+                # Xác định có đọc giọng AI (TTS) hay không:
                 has_chinese_in_trans = bool(CHINESE_CHAR_RE.search(trans_txt))
-                skip_tts = is_noise or (not trans_txt) or has_chinese_in_trans
+                skip_tts = is_no_voice or is_noise or (not trans_txt) or has_chinese_in_trans
 
-                # Nếu skip_tts vì rỗng hoặc còn chữ Hán/quảng cáo, để trống effective_trans để TTS không đọc nhầm tiếng Trung
-                effective_trans = "" if skip_tts else trans_txt
+                # Phụ đề Tiếng Việt in lên video (Hardsub):
+                # Tuyệt đối không xóa trắng bản dịch khi người dùng chọn 'Không lồng tiếng'!
+                # Chỉ bỏ qua phụ đề nếu câu thoại là rác/quảng cáo hoặc không có bản dịch.
+                effective_trans = "" if (is_noise or not trans_txt) else trans_txt
+
+                c_meta = cue.get("metadata") if isinstance(cue.get("metadata"), dict) else {}
+                raw_box = cue.get("ocr_box_index") if cue.get("ocr_box_index") is not None else c_meta.get("ocr_box_index")
+                raw_pos = cue.get("position") or c_meta.get("position")
+                calc_box = int(raw_box if raw_box is not None else (2 if str(raw_pos or "").lower() == "top" else 1))
+                calc_pos = str(raw_pos or ("top" if calc_box == 2 else "bottom")).lower()
 
                 seg = SubtitleSegment(
                     id=idx,
@@ -301,13 +457,15 @@ class SingleVoicePipelineWorker(QThread):
                     end=end_s,
                     text=orig_txt,
                     translated_text=effective_trans,
-                    voice_id=voice_id,
-                    voice_name=voice_name,
-                    gender="male",
-                    final_gender="male",
+                    voice_id="none" if is_no_voice else voice_id,
+                    voice_name="None" if is_no_voice else voice_name,
+                    gender="none" if is_no_voice else "male",
+                    final_gender="none" if is_no_voice else "male",
                     is_noise=is_noise,
                     skip_tts=skip_tts,
                     bbox=cue.get("bbox", []) or [],
+                    ocr_box_index=calc_box,
+                    position=calc_pos,
                 )
                 segments.append(seg)
 
@@ -315,11 +473,23 @@ class SingleVoicePipelineWorker(QThread):
         creator_config.enable_blur_mask = self.enable_blur_mask
         creator_config.mask_mode = self.mask_mode
         creator_config.blur_rect = self.blur_rect
+        creator_config.dynamic_mask = self.dynamic_mask if self.dynamic_mask is not None else True
         creator_config.burn_subtitles = self.burn_subtitles
+        if self.subtitle_config:
+            self.subtitle_config.blur_rect_2 = self.blur_rect_2
+            self.subtitle_config.dynamic_mask = creator_config.dynamic_mask
         creator_config.subtitle_config = self.subtitle_config
-        creator_config.original_volume = float(self.audio_mix_settings.get("original_volume", 0.50))
-        creator_config.tts_volume = float(self.audio_mix_settings.get("tts_volume", 1.00))
-        creator_config.duck_volume = float(self.audio_mix_settings.get("duck_volume", 0.20))
+
+        is_no_voice_mode = (not self.dual_voice_config and (self.selected_voice.get("id") in ("no_voiceover", "none", "no_voice") or str(self.selected_voice.get("provider", "")).lower() == "none"))
+        if is_no_voice_mode:
+            orig_vol = float(self.audio_mix_settings.get("original_volume", 1.00))
+            creator_config.original_volume = max(0.1, orig_vol) if orig_vol > 0.0 else 1.00
+            creator_config.tts_volume = 0.00
+            creator_config.duck_volume = 0.00
+        else:
+            creator_config.original_volume = float(self.audio_mix_settings.get("original_volume", 0.50))
+            creator_config.tts_volume = float(self.audio_mix_settings.get("tts_volume", 1.00))
+            creator_config.duck_volume = float(self.audio_mix_settings.get("duck_volume", 0.20))
 
         # Cấu hình Logo Thương hiệu
         if self.brand_logo_settings and isinstance(self.brand_logo_settings, dict):
@@ -328,6 +498,28 @@ class SingleVoicePipelineWorker(QThread):
             creator_config.brand_logo_position = str(self.brand_logo_settings.get("position", "top_left"))
             creator_config.brand_logo_size_percent = int(self.brand_logo_settings.get("size_percent", 15))
             creator_config.brand_logo_opacity = float(self.brand_logo_settings.get("opacity", 1.0))
+            creator_config.brand_logo_custom_rect = self.brand_logo_settings.get("custom_rect")
+
+        # Cấu hình Khung viền video trang trí
+        if self.frame_border_settings and isinstance(self.frame_border_settings, dict):
+            creator_config.enable_frame_border = bool(self.frame_border_settings.get("enable", False))
+            creator_config.frame_border_top_path = str(self.frame_border_settings.get("top_path", "") or self.frame_border_settings.get("path", "")).strip()
+            creator_config.frame_border_bottom_path = str(self.frame_border_settings.get("bottom_path", "")).strip()
+            creator_config.frame_border_path = creator_config.frame_border_top_path or creator_config.frame_border_bottom_path
+            creator_config.frame_border_opacity = float(self.frame_border_settings.get("opacity", 1.0))
+            creator_config.frame_border_top_height = int(self.frame_border_settings.get("top_height", 0) or 0)
+            creator_config.frame_border_bottom_height = int(self.frame_border_settings.get("bottom_height", 0) or 0)
+
+        # Cấu hình Thu phóng video kiểu CapCut (100% - 150%)
+        zoom_val = 100
+        if hasattr(self, "video_scale_percent") and self.video_scale_percent:
+            zoom_val = int(self.video_scale_percent)
+        elif self.frame_border_settings and "video_scale_percent" in self.frame_border_settings:
+            zoom_val = int(self.frame_border_settings["video_scale_percent"])
+        else:
+            from PySide6.QtCore import QSettings
+            zoom_val = QSettings("TankVideo", "TankVideoStudio").value("branding/video_scale_percent", 100, type=int)
+        creator_config.video_scale_percent = zoom_val
 
         # Cấu hình Hình mờ chữ Watermark
         if self.watermark_settings and isinstance(self.watermark_settings, dict):
@@ -337,6 +529,7 @@ class SingleVoicePipelineWorker(QThread):
             creator_config.watermark_font_size = int(self.watermark_settings.get("font_size", 36))
             creator_config.watermark_opacity = float(self.watermark_settings.get("opacity", 0.35))
             creator_config.watermark_color = str(self.watermark_settings.get("color", "#FFFFFF"))
+            creator_config.watermark_custom_rect = self.watermark_settings.get("custom_rect")
 
         # Cấu hình Xóa Logo & Watermark video gốc (Delogo AI)
         if self.delogo_settings and isinstance(self.delogo_settings, dict):
@@ -372,13 +565,22 @@ class SingleVoicePipelineWorker(QThread):
             )
             creator_config.voice_config = vm_config
         else:
-            single_va = VoiceAssignment(
-                voice_id=voice_id,
-                name=voice_name,
-                provider=str(self.selected_voice.get("provider", "piper")),
-                gender="male",
-                speed=1.0,
-            )
+            if is_no_voice_mode:
+                single_va = VoiceAssignment(
+                    voice_id="none",
+                    name="None",
+                    provider="none",
+                    gender="none",
+                    speed=1.0,
+                )
+            else:
+                single_va = VoiceAssignment(
+                    voice_id=voice_id,
+                    name=voice_name,
+                    provider=str(self.selected_voice.get("provider", "piper")),
+                    gender="male",
+                    speed=1.0,
+                )
             vm_config = VoiceMappingConfig(
                 default_male_voice=single_va,
                 default_female_voice=single_va,
@@ -404,24 +606,156 @@ class SingleVoicePipelineWorker(QThread):
         service = VideoCreatorService()
         result = service.run(request)
 
+        if getattr(result, "status", "") == "cancelled" or self._cancel_event.is_set():
+            self.pipeline_cancelled.emit()
+            return
+
         if getattr(result, "status", "") == "failed":
             raise RuntimeError(getattr(result, "error", "") or "Quá trình xuất video thất bại.")
 
-        if self._cancel_event.is_set():
-            return
-
-        # Xuất file SRT phụ đề tiếng Việt ngay cạnh video kết quả
-        try:
-            from app.translation.srt_utils import to_srt
-            srt_path = os.path.splitext(self.output_video_path)[0] + ".srt"
-            with open(srt_path, "w", encoding="utf-8") as f_srt:
-                f_srt.write(to_srt(translated_cues, prefer_translated=True))
-            self.log_emitted.emit(f"[Phụ đề] Đã xuất file phụ đề tiếng Việt: {os.path.basename(srt_path)}")
-        except Exception as srt_e:
-            self.log_emitted.emit(f"[Phụ đề] Ghi nhận phụ đề SRT: {srt_e}")
-
         self.progress_updated.emit(100.0, "Hoàn tất tạo video thành công!")
-        self.pipeline_finished.emit(result, translated_cues)
+        final_cues = [s.to_dict() for s in segments]
+        self.pipeline_finished.emit(result, final_cues)
+
+    def _run_asr_supplement(self, existing_ocr_cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Quét nhận diện âm thanh bổ sung cho nhiều đoạn tin nhắn hoặc phân cảnh không có chữ phụ đề."""
+        if not self.video_path or not os.path.isfile(self.video_path):
+            return []
+
+        mode = str(self.asr_supplement_settings.get("mode", "range") or "range").lower()
+        raw_ranges = list(self.asr_supplement_settings.get("ranges") or [])
+        if not raw_ranges:
+            s_s = max(0.0, float(self.asr_supplement_settings.get("start_seconds", 0.0) or 0.0))
+            e_s = float(self.asr_supplement_settings.get("end_seconds", 0.0) or 0.0)
+            if e_s > s_s:
+                raw_ranges = [(s_s, e_s)]
+            elif mode == "all":
+                raw_ranges = [(0.0, 0.0)]
+
+        if not raw_ranges and mode != "all":
+            self.log_emitted.emit("[ASR Bổ sung] Chưa thiết lập khoảng thời gian quét. Bỏ qua.")
+            return []
+
+        placement = str(self.asr_supplement_settings.get("placement", "bottom") or "bottom").lower()
+        target_box_idx = 2 if placement == "top" else 1
+        target_pos = "top" if target_box_idx == 2 else "bottom"
+        fallback_rect = list(self.blur_rect_2 or [0.08, 0.09, 0.84, 0.085]) if target_box_idx == 2 else list(self.blur_rect or [0.08, 0.70, 0.84, 0.09])
+
+        scratch_dir = os.path.join(self.workspace_root, "scratch")
+        os.makedirs(scratch_dir, exist_ok=True)
+        import uuid
+        import subprocess
+        from app.sensevoice_processor import transcribe_audio
+        from runtime_paths import models_path
+        from services.subtitle_merge_service import SubtitleMergeService
+
+        sv_dir = str(models_path("sensevoice"))
+        if not os.path.isdir(sv_dir):
+            self.log_emitted.emit(f"[ASR Bổ sung] Thư mục mô hình SenseVoice không tìm thấy ({sv_dir}). Bỏ qua ASR.")
+            return []
+
+        all_collected_cues = []
+
+        for r_idx, (r_start, r_end) in enumerate(raw_ranges, 1):
+            if self._cancel_event.is_set():
+                break
+
+            is_range_part = (r_end > r_start)
+            r_desc = f"Đoạn {r_idx} ({r_start:.1f}s -> {r_end:.1f}s)" if is_range_part else "Toàn bộ video"
+            self.log_emitted.emit(f"[ASR Bổ sung] Đang xử lý {r_desc}...")
+
+            temp_wav = os.path.join(scratch_dir, f"asr_supp_{uuid.uuid4().hex[:8]}.wav")
+            try:
+                ffmpeg_cmd = ["ffmpeg", "-y"]
+                if is_range_part:
+                    ffmpeg_cmd.extend(["-ss", f"{r_start:.2f}", "-to", f"{r_end:.2f}"])
+                ffmpeg_cmd.extend(["-i", self.video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", temp_wav])
+
+                proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if proc.returncode != 0 or not os.path.isfile(temp_wav) or os.path.getsize(temp_wav) < 1000:
+                    self.log_emitted.emit(f"[ASR Bổ sung] Không thể trích xuất audio cho {r_desc}.")
+                    continue
+
+                raw_asr = transcribe_audio(temp_wav, sv_dir, language="zh") or []
+                if not raw_asr:
+                    self.log_emitted.emit(f"[ASR Bổ sung] {r_desc}: Không phát hiện thấy giọng nói.")
+                    continue
+
+                base_offset = r_start if is_range_part else 0.0
+                split_items = []
+                for item in raw_asr:
+                    a_start = base_offset + float(item.get("start", 0.0))
+                    a_end = base_offset + float(item.get("end", 0.0))
+                    raw_txt = str(item.get("text", "")).strip()
+                    if not raw_txt:
+                        continue
+
+                    parts = [p.strip() for p in re.split(r'([。？！?!，,]+)', raw_txt) if p.strip()]
+                    sentences = []
+                    for idx in range(0, len(parts), 2):
+                        sent = parts[idx]
+                        if idx + 1 < len(parts):
+                            sent += parts[idx + 1]
+                        sentences.append(sent)
+
+                    if len(sentences) <= 1 or (a_end - a_start) <= 3.0:
+                        split_items.append({"start": round(a_start, 3), "end": round(a_end, 3), "text": raw_txt})
+                    else:
+                        tot_len = sum(max(1, len(s)) for s in sentences)
+                        tot_dur = max(0.5, a_end - a_start)
+                        cur_t = a_start
+                        for sent in sentences:
+                            s_dur = round(tot_dur * (len(sent) / tot_len), 3)
+                            s_end = round(cur_t + s_dur, 3)
+                            if sent.strip():
+                                split_items.append({"start": cur_t, "end": s_end, "text": sent.strip()})
+                            cur_t = s_end
+
+                # Lọc trùng với OCR và các câu ASR đã thêm
+                for item in split_items:
+                    i_txt = item["text"]
+                    i_start = item["start"]
+                    i_end = item["end"]
+
+                    is_dup = False
+                    for ocr_c in existing_ocr_cues + all_collected_cues:
+                        o_txt = str(ocr_c.get("text", "") or ocr_c.get("original_text", "")).strip()
+                        o_start = float(ocr_c.get("start", 0.0))
+                        o_end = float(ocr_c.get("end", 0.0))
+
+                        time_overlap = (max(0.0, min(i_end, o_end) - max(i_start, o_start)) > 0.3) or abs(i_start - o_start) < 2.0
+                        if time_overlap and SubtitleMergeService.are_cues_near_duplicate(i_txt, o_txt, min_similarity=0.75):
+                            is_dup = True
+                            break
+                        if time_overlap and ((len(i_txt) >= 4 and i_txt in o_txt) or (len(o_txt) >= 4 and o_txt in i_txt)):
+                            is_dup = True
+                            break
+
+                    if not is_dup:
+                        all_collected_cues.append({
+                            "start": i_start,
+                            "end": i_end,
+                            "text": i_txt,
+                            "original_text": i_txt,
+                            "ocr_box_index": target_box_idx,
+                            "position": target_pos,
+                            "bbox": fallback_rect,
+                            "source": "asr_supplement",
+                        })
+
+            except Exception as e:
+                self.log_emitted.emit(f"[ASR Bổ sung] Lỗi xử lý {r_desc}: {e}")
+            finally:
+                if os.path.isfile(temp_wav):
+                    try:
+                        os.remove(temp_wav)
+                    except Exception:
+                        pass
+
+        all_collected_cues = sorted(all_collected_cues, key=lambda c: float(c.get("start", 0.0)))
+        box_title = "Khung 2 (Đỉnh)" if target_box_idx == 2 else "Khung 1 (Đáy)"
+        self.log_emitted.emit(f"[ASR Bổ sung] Đã lọc ra tổng cộng {len(all_collected_cues)} câu thoại bổ sung độc lập từ {len(raw_ranges)} đoạn, gán vị trí: {box_title}.")
+        return all_collected_cues
 
 
 class SingleVoiceProgressDialog(QDialog):
@@ -443,8 +777,15 @@ class SingleVoiceProgressDialog(QDialog):
         output_video_path: str = "",
         subtitle_config: SubtitleRenderConfig | None = None,
         brand_logo_settings: dict[str, Any] | None = None,
+        frame_border_settings: dict[str, Any] | None = None,
         watermark_settings: dict[str, Any] | None = None,
         delogo_settings: dict[str, Any] | None = None,
+        dual_voice_config: dict[str, Any] | None = None,
+        approved_cues: list[dict[str, Any]] | None = None,
+        blur_rect_2: tuple[float, float, float, float] | None = None,
+        is_dual_ocr: bool = False,
+        dynamic_mask: bool = True,
+        asr_supplement_settings: dict[str, Any] | None = None,
     ):
         super().__init__(parent)
         self.workspace_root = workspace_root
@@ -455,18 +796,29 @@ class SingleVoiceProgressDialog(QDialog):
         self.subtitle_config = subtitle_config or SubtitleRenderConfig()
         self.mask_mode = str(mask_mode or getattr(self.subtitle_config, "mask_mode", "box") or "box").strip().lower()
         self.blur_rect = blur_rect
+        self.blur_rect_2 = blur_rect_2
+        self.is_dual_ocr = is_dual_ocr
+        self.dynamic_mask = dynamic_mask
         self.burn_subtitles = burn_subtitles
         self.existing_cues = existing_cues
+        self.asr_supplement_settings = asr_supplement_settings or {}
         self.output_video_path = output_video_path
         self.brand_logo_settings = brand_logo_settings or {}
+        self.frame_border_settings = frame_border_settings or {}
         self.watermark_settings = watermark_settings or {}
         self.delogo_settings = delogo_settings or {}
+        self.dual_voice_config = dual_voice_config
+        self.approved_cues = approved_cues
+        self._close_requested = False
 
         self._worker: SingleVoicePipelineWorker | None = None
         self._last_result: VideoCreatorResult | None = None
         self._translated_cues: list[dict[str, Any]] = []
 
-        self.setWindowTitle("Tiến trình tạo video (1 giọng) - Toàn bộ quy trình")
+        if self.is_dual_ocr:
+            self.setWindowTitle("🎬 Tạo video 2 Khung OCR (1 Giọng) - Mặt nạ che mờ động")
+        else:
+            self.setWindowTitle("Tiến trình tạo video (1 giọng) - Toàn bộ quy trình")
         self.resize(750, 520)
         self.setMinimumSize(650, 450)
 
@@ -608,9 +960,16 @@ class SingleVoiceProgressDialog(QDialog):
             output_video_path=self.output_video_path,
             subtitle_config=self.subtitle_config,
             brand_logo_settings=self.brand_logo_settings,
+            frame_border_settings=self.frame_border_settings,
             watermark_settings=self.watermark_settings,
             delogo_settings=self.delogo_settings,
-            parent=self,
+            dual_voice_config=getattr(self, "dual_voice_config", None),
+            approved_cues=getattr(self, "approved_cues", None),
+            blur_rect_2=self.blur_rect_2,
+            is_dual_ocr=self.is_dual_ocr,
+            dynamic_mask=self.dynamic_mask,
+            asr_supplement_settings=self.asr_supplement_settings,
+            parent=None,
         )
 
         self._worker.progress_updated.connect(self._on_progress_updated)
@@ -618,9 +977,11 @@ class SingleVoiceProgressDialog(QDialog):
         self._worker.log_emitted.connect(self._on_log_emitted)
         self._worker.pipeline_finished.connect(self._on_pipeline_finished)
         self._worker.pipeline_error.connect(self._on_pipeline_error)
+        self._worker.pipeline_cancelled.connect(self._on_pipeline_cancelled)
+        self._worker.finished.connect(self._on_worker_finished)
 
         self._start_time = time.time()
-        self._worker.start()
+        self._worker.start(QThread.Priority.HighestPriority)
 
     def _on_progress_updated(self, pct: float, message: str):
         val = max(0, min(100, int(round(pct))))
@@ -634,10 +995,15 @@ class SingleVoiceProgressDialog(QDialog):
         elif stage == "translate":
             self.lbl_step1.setText("1. 📄 Dịch DeepSeek AI\n[🔄 Đang dịch]")
             self.lbl_step1.setStyleSheet("color: #ff7b1a; font-weight: bold; font-size: 11px;")
+        elif stage == "gender":
+            self.lbl_step1.setText("1. 📄 OCR & Phân vai AI\n[🔄 Đang phân vai]")
+            self.lbl_step1.setStyleSheet("color: #ff7b1a; font-weight: bold; font-size: 11px;")
         elif stage == "render":
-            self.lbl_step1.setText("1. 📄 OCR & DeepSeek\n[✅ Đã xong]")
+            step1_lbl = "1. 📄 OCR & Phân vai AI" if getattr(self, "dual_voice_config", None) else "1. 📄 OCR & DeepSeek"
+            self.lbl_step1.setText(f"{step1_lbl}\n[✅ Đã xong]")
             self.lbl_step1.setStyleSheet("color: #3fb950; font-weight: bold; font-size: 11px;")
-            self.lbl_step2.setText("2. 🎙️ Lồng tiếng AI (1 giọng)\n[🔄 Đang tạo]")
+            step2_lbl = "2. 🎙️ Lồng tiếng Phân vai" if getattr(self, "dual_voice_config", None) else "2. 🎙️ Lồng tiếng AI (1 giọng)"
+            self.lbl_step2.setText(f"{step2_lbl}\n[🔄 Đang tạo]")
             self.lbl_step2.setStyleSheet("color: #ff7b1a; font-weight: bold; font-size: 11px;")
             self.lbl_step3.setText("3. 🎞️ Che chữ & Xuất MP4\n[🔄 Đang xử lý]")
             self.lbl_step3.setStyleSheet("color: #ff7b1a; font-weight: bold; font-size: 11px;")
@@ -672,9 +1038,11 @@ class SingleVoiceProgressDialog(QDialog):
                     parent_gui._video_translated_cues[norm_v] = translated_cues
                 self._sync_to_parent_gui(parent_gui, translated_cues)
 
-        self.lbl_step1.setText("1. 📄 OCR & DeepSeek\n[✅ Xong]")
+        step1_lbl = "1. 📄 OCR & Phân vai AI" if getattr(self, "dual_voice_config", None) else "1. 📄 OCR & DeepSeek"
+        self.lbl_step1.setText(f"{step1_lbl}\n[✅ Xong]")
         self.lbl_step1.setStyleSheet("color: #3fb950; font-weight: bold; font-size: 11px;")
-        self.lbl_step2.setText("2. 🎙️ Lồng tiếng AI (1 giọng)\n[✅ Xong]")
+        step2_lbl = "2. 🎙️ Lồng tiếng Phân vai" if getattr(self, "dual_voice_config", None) else "2. 🎙️ Lồng tiếng AI (1 giọng)"
+        self.lbl_step2.setText(f"{step2_lbl}\n[✅ Xong]")
         self.lbl_step2.setStyleSheet("color: #3fb950; font-weight: bold; font-size: 11px;")
         self.lbl_step3.setText("3. 🎞️ Che chữ & Xuất MP4\n[✅ Hoàn thành]")
         self.lbl_step3.setStyleSheet("color: #3fb950; font-weight: bold; font-size: 11px;")
@@ -709,10 +1077,46 @@ class SingleVoiceProgressDialog(QDialog):
                 QMessageBox.No,
             )
             if ans == QMessageBox.Yes:
-                self.lbl_status.setText("Đang yêu cầu hủy...")
+                self.btn_cancel.setEnabled(False)
+                self.btn_cancel.setText("Đang hủy...")
+                self.lbl_status.setText("⏹️ Đang dừng tiến trình an toàn...")
+                self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold; font-size: 12px;")
+                self.log_box.append("⏹️ Người dùng yêu cầu hủy tiến trình (đang dừng an toàn tại checkpoint)...")
                 self._worker.request_cancel()
-                self._worker.wait(2000)
-                self.reject()
+
+    def _on_pipeline_cancelled(self):
+        self.lbl_status.setText("⏹️ Đã dừng và hủy tiến trình tạo video.")
+        self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold; font-size: 12px;")
+        self.log_box.append("\n" + "=" * 50)
+        self.log_box.append("⏹️ TIẾN TRÌNH TẠO VIDEO ĐÃ ĐƯỢC DỪNG VÀ HỦY AN TOÀN.")
+        self.log_box.append("=" * 50)
+        self.btn_cancel.setVisible(False)
+        self.btn_close.setEnabled(True)
+        if getattr(self, "_close_requested", False):
+            super().reject()
+
+    def _on_worker_finished(self):
+        if self._worker:
+            self._worker.deleteLater()
+            self._worker = None
+        if getattr(self, "_close_requested", False):
+            super().reject()
+
+    def closeEvent(self, event):
+        if self._worker and self._worker.isRunning():
+            event.ignore()
+            self._close_requested = True
+            self._on_cancel_clicked()
+        else:
+            event.accept()
+            super().closeEvent(event)
+
+    def reject(self):
+        if self._worker and self._worker.isRunning():
+            self._close_requested = True
+            self._on_cancel_clicked()
+            return
+        super().reject()
 
     def _on_open_folder_clicked(self):
         out_path = self.output_video_path
@@ -762,6 +1166,7 @@ class SingleVoiceProgressDialog(QDialog):
             parent_gui.current_translated_segments = trans_segs
             if base_segs:
                 parent_gui.current_segments = base_segs
+            parent_gui._pipeline_synced_segment_lists = (trans_segs, base_segs)
 
             if hasattr(parent_gui, "timeline") and hasattr(parent_gui.timeline, "set_segments"):
                 parent_gui.timeline.set_segments(trans_segs)
@@ -771,5 +1176,11 @@ class SingleVoiceProgressDialog(QDialog):
 
             if hasattr(parent_gui, "toggle_ocr_overlay_visibility"):
                 parent_gui.toggle_ocr_overlay_visibility(False)
+
+            if getattr(self, "burn_subtitles", False):
+                parent_gui._preview_video_has_burned_subtitles = True
+                if hasattr(parent_gui, "video_view") and hasattr(parent_gui.video_view, "subtitle_item"):
+                    parent_gui.video_view.subtitle_item.set_text("")
+                    parent_gui.video_view.subtitle_item.hide()
         except Exception:
             pass

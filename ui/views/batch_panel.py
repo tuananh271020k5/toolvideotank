@@ -14,12 +14,11 @@ Cho phép:
 import os
 import time
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QFrame, QScrollArea, QSpinBox,
-    QComboBox, QProgressBar, QMenu, QFileDialog, QSizePolicy,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea, QSpinBox,
+    QProgressBar, QMenu, QFileDialog,
 )
 
 

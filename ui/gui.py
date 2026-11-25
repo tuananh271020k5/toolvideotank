@@ -91,6 +91,13 @@ class _RuntimeLogCollector:
             log_dir = os.path.join(root, "temp")
             os.makedirs(log_dir, exist_ok=True)
             self._file_path = os.path.join(log_dir, "capcap_runtime.log")
+            # Keep the previous session's log: when the app hangs/crashes
+            # the user restarts it, and overwriting would erase the evidence.
+            if os.path.isfile(self._file_path):
+                try:
+                    os.replace(self._file_path, os.path.join(log_dir, "capcap_runtime.prev.log"))
+                except OSError:
+                    pass
             with open(self._file_path, "w", encoding="utf-8") as handle:
                 handle.write("[CapCap] Runtime log started.\n")
         except OSError:
@@ -181,6 +188,59 @@ def _capture_runtime_output():
     return collector
 
 
+def _install_hang_watchdog(app_root: str):
+    """Dump every thread's stack when the Qt main thread stops responding.
+
+    Windows silently kills a GUI that is unresponsive for too long, leaving
+    no Python traceback.  A heartbeat timer runs on the UI thread; a daemon
+    thread notices when it stalls (>6s) and writes all stacks to
+    temp/capcap_hang.log so the blocking call can be identified.
+    """
+    if str(os.getenv("CAPCAP_HANG_WATCHDOG", "1")).strip().lower() in {"0", "false", "off", "no"}:
+        return None
+    try:
+        import faulthandler
+        import time
+
+        log_dir = os.path.join(app_root, "temp")
+        os.makedirs(log_dir, exist_ok=True)
+        handle = open(os.path.join(log_dir, "capcap_hang.log"), "a", encoding="utf-8")
+        handle.write(f"\n[CapCap] Session started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        handle.flush()
+        faulthandler.enable(handle, all_threads=True)
+
+        state = {"beat": time.monotonic(), "dumped": False}
+
+        def _beat():
+            state["beat"] = time.monotonic()
+
+        heartbeat = QTimer()
+        heartbeat.setInterval(500)
+        heartbeat.timeout.connect(_beat)
+        heartbeat.start()
+
+        def _watch():
+            while True:
+                time.sleep(1.0)
+                lag = time.monotonic() - state["beat"]
+                if lag > 6.0 and not state["dumped"]:
+                    state["dumped"] = True
+                    try:
+                        handle.write(f"\n=== UI blocked {lag:.1f}s at {time.strftime('%H:%M:%S')} ===\n")
+                        handle.flush()
+                        faulthandler.dump_traceback(handle, all_threads=True)
+                        handle.flush()
+                    except Exception:
+                        pass
+                elif lag < 2.0:
+                    state["dumped"] = False
+
+        threading.Thread(target=_watch, name="ui-hang-watchdog", daemon=True).start()
+        return heartbeat, handle
+    except Exception:
+        return None
+
+
 def _app_root() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
@@ -224,9 +284,15 @@ if __name__ == "__main__":
     app_root = _app_root()
     _bootstrap_env(app_root)
     _bootstrap_workspace()
+    try:
+        from app.runtime_paths import optimize_windows_performance
+        optimize_windows_performance()
+    except Exception:
+        pass
     os.chdir(app_root)
     runtime_logs = _capture_runtime_output()
     app = QApplication(sys.argv)
+    _hang_watchdog = _install_hang_watchdog(app_root)
     app.setQuitOnLastWindowClosed(True)
 
     def _on_about_to_quit():

@@ -43,6 +43,9 @@ class Segment:
             "character_confidence",
             "character_source",
             "speaker_confidence",
+            "ocr_box_index",
+            "position",
+            "bbox",
         ):
             if key in data and key not in metadata:
                 metadata[key] = data.get(key)
@@ -91,6 +94,9 @@ class Segment:
             "character_gender",
             "character_confidence",
             "character_source",
+            "ocr_box_index",
+            "position",
+            "bbox",
         ):
             if key in data:
                 metadata[key] = data[key]
@@ -127,7 +133,7 @@ class Segment:
         return self.subtitle_text
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "id": self.id,
             "start": self.start,
             "end": self.end,
@@ -140,6 +146,10 @@ class Segment:
             "status": self.status,
             "metadata": self.metadata,
         }
+        for key in ("ocr_box_index", "position", "bbox", "speaker", "voice_name", "voice_group"):
+            if key in self.metadata:
+                d[key] = self.metadata[key]
+        return d
 
     def to_subtitle_dict(self) -> dict[str, Any]:
         payload = {
@@ -163,6 +173,7 @@ class Segment:
             "voice_name", "voice_group", "speaker_confidence",
             "audio_speaker", "character_id", "character_gender",
             "character_confidence", "character_source",
+            "ocr_box_index", "position", "bbox",
         ):
             if key in self.metadata:
                 payload[key] = self.metadata.get(key)
@@ -189,6 +200,7 @@ class Segment:
             "voice_name", "voice_group", "speaker_confidence",
             "audio_speaker", "character_id", "character_gender",
             "character_confidence", "character_source",
+            "ocr_box_index", "position", "bbox",
         ):
             if key in self.metadata:
                 payload[key] = self.metadata.get(key)

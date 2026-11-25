@@ -59,6 +59,10 @@ def ffprobe_wav_duration(wav_path: str) -> float:
         return 0.0
 
 
+# Dubbed speech rate (see duration_fitting_service.DUB_SAMPLE_RATE).
+DUB_SAMPLE_RATE = "24000"
+
+
 def _build_atempo_filter(speed_ratio: float) -> str:
     ratio = max(0.01, float(speed_ratio))
     filters = []
@@ -112,7 +116,7 @@ def fit_wav_to_duration(
         cmd = [
             ffmpeg, "-y", "-i", input_wav_path,
             "-t", str(target_duration),
-            "-ar", "16000", "-ac", "1",
+            "-ar", DUB_SAMPLE_RATE, "-ac", "1",
             output_wav_path,
         ]
     elif mode_key == "smart":
@@ -130,7 +134,7 @@ def fit_wav_to_duration(
             cmd = [
                 ffmpeg, "-y", "-i", input_wav_path,
                 "-filter:a", filter_chain,
-                "-ar", "16000", "-ac", "1",
+                "-ar", DUB_SAMPLE_RATE, "-ac", "1",
                 output_wav_path,
             ]
         else:
@@ -139,7 +143,7 @@ def fit_wav_to_duration(
             cmd = [
                 ffmpeg, "-y", "-i", input_wav_path,
                 "-t", str(target_duration),
-                "-ar", "16000", "-ac", "1",
+                "-ar", DUB_SAMPLE_RATE, "-ac", "1",
                 output_wav_path,
             ]
     else:
@@ -153,7 +157,7 @@ def fit_wav_to_duration(
         cmd = [
             ffmpeg, "-y", "-i", input_wav_path,
             "-filter:a", filter_chain,
-            "-ar", "16000", "-ac", "1",
+            "-ar", DUB_SAMPLE_RATE, "-ac", "1",
             output_wav_path,
         ]
 
@@ -190,7 +194,7 @@ def change_wav_speed(
         "-filter:a",
         filter_chain,
         "-ar",
-        "16000",
+        DUB_SAMPLE_RATE,
         "-ac",
         "1",
         output_wav_path,

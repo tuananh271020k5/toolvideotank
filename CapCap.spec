@@ -56,6 +56,7 @@ datas = [
     (str(project_root / "ui" / "views" / "editor"), "views/editor"),
     (str(project_root / "gender_voice_ai_windows_package"), "gender_voice_ai_windows_package"),
     (str(project_root / "app" / "vieneu_worker.py"), "app"),
+    (str(project_root / "app" / "gender_worker.py"), "app"),
 ]
 # Filter out optional files not present on disk so PyInstaller doesn't abort
 datas = [(s, d) for s, d in datas if Path(s).exists()]
@@ -154,6 +155,10 @@ a = Analysis(
         "translation.providers.gemini_polisher",
         "translation.providers.google_web_translator",
         "translation.providers.microsoft_translator",
+        "app.translation",
+        "app.translation.providers",
+        "app.translation.providers.gemini_polisher",
+        "app.translation.providers.google_web_translator",
         # Lazy-loaded workflows
         "workflows.prepare_workflow",
         "workflows.voice_workflow",
@@ -202,6 +207,8 @@ a = Analysis(
         # timeline at runtime.  PyInstaller does not reliably discover
         # modules beneath the project-level ``app`` namespace automatically.
         "app.runtime_paths",
+        "app.services.video_cutter_service",
+        "ui.dialogs.video_cutter_dialog",
         "runtime_profile",
         # OCR engine
         "rapidocr",
@@ -242,6 +249,11 @@ a = Analysis(
         "app.services.temporal_gender_smoothing",
         "app.services.fuzzy_duplicate_service",
         "app.services.decision_fusion_service",
+        "app.services.smart_audio_transcriber",
+        "app.services.speech_subtitle_fusion",
+        "services.speech_subtitle_fusion",
+        "ui.dialogs.smart_video_dialog",
+        "ui.dialogs.voice_gender_progress_dialog",
         "ui.worker_adapters.video_creator_adapter",
         # Playwright – required by RedNote/Xiaohongshu and other browser-based scanners
         "playwright",

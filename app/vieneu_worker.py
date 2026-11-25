@@ -9,6 +9,13 @@ try:
 except ImportError:
     Vieneu = None
 
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+
 LOADED_MODELS = {}
 
 
@@ -17,13 +24,10 @@ def get_or_load_model(model_path: str):
     norm_path = os.path.normpath(model_path)
     if norm_path not in LOADED_MODELS:
         print(f"[VieNeu Server] Caching model: {norm_path}...", flush=True)
-        tts = Vieneu(
-            mode="v3turbo",
-            backbone_repo=norm_path,
-            backend="pytorch",
-            device="cpu",
-            dtype="float32",
-        )
+        kwargs = {"mode": "v3turbo", "backbone_repo": norm_path, "device": "cpu", "dtype": "float32"}
+        if HAS_TORCH:
+            kwargs["backend"] = "pytorch"
+        tts = Vieneu(**kwargs)
         LOADED_MODELS[norm_path] = tts
         print(f"[VieNeu Server] Model cached successfully: {norm_path}", flush=True)
     return LOADED_MODELS[norm_path]
@@ -115,13 +119,10 @@ def run_cli(args):
         raise ValueError("TTS text is empty.")
 
     print("[VieNeu] Loading model...", flush=True)
-    tts = Vieneu(
-        mode="v3turbo",
-        backbone_repo=args.model,
-        backend="pytorch",
-        device="cpu",
-        dtype="float32",
-    )
+    kwargs = {"mode": "v3turbo", "backbone_repo": args.model, "device": "cpu", "dtype": "float32"}
+    if HAS_TORCH:
+        kwargs["backend"] = "pytorch"
+    tts = Vieneu(**kwargs)
     print("[VieNeu] Synthesizing...", flush=True)
     audio = tts.infer(text, voice=args.voice)
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

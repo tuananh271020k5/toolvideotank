@@ -13,15 +13,13 @@ import copy
 import hashlib
 import json
 import os
-import sys
 import subprocess
 from uuid import uuid4
 
 from runtime_paths import bin_path, subprocess_hidden_kwargs
-from PySide6.QtCore import QSettings, Qt, QUrl
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
-    QPushButton, QSlider, QProgressBar, QLabel, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox, QTabWidget, QSplitter, QScrollArea, QFrame, QDialog,
+    QComboBox, QDialog,
     QAbstractItemView,
     QFileDialog,
     QHBoxLayout,
@@ -62,7 +60,7 @@ class VoiceGenderMixin:
             self.video_path_edit.text().strip() if hasattr(self, "video_path_edit") else ""
         )
         if not video_path or not os.path.isfile(video_path):
-            QMessageBox.warning(self, "Kiểm tra giọng nói", "Hãy import một video hợp lệ trước.")
+            QMessageBox.warning(self, "Phân vai AI", "Vui lòng chọn hoặc import một file video hợp lệ trước khi bấm Phân vai AI.")
             return
         running = getattr(self, "_voice_gender_check_worker", None)
         if running is not None and running.isRunning():
@@ -121,14 +119,31 @@ class VoiceGenderMixin:
         if ocr_rect:
             os.environ["OCR_SUBTITLE_RECT"] = f"{ocr_rect[0]:.4f},{ocr_rect[1]:.4f},{ocr_rect[2]:.4f},{ocr_rect[3]:.4f}"
 
-        worker = VoiceGenderCheckWorker(video_path, existing_cues=existing_cues if existing_cues else None, ocr_rect=ocr_rect)
         self._voice_gender_check_video_path = video_path
-        self._voice_gender_check_worker = worker
-        worker.progress.connect(self._on_voice_gender_check_progress)
-        worker.completed.connect(self._on_voice_gender_check_completed)
-        worker.finished.connect(lambda: self._finish_voice_gender_check_worker(worker))
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+
+        try:
+            from ui.dialogs.voice_gender_progress_dialog import VoiceGenderProgressDialog
+            dialog = VoiceGenderProgressDialog(
+                self,
+                video_path=video_path,
+                existing_cues=existing_cues if existing_cues else None,
+                ocr_rect=ocr_rect,
+            )
+            self._voice_gender_progress_dialog = dialog
+            dialog.exec()
+
+            if dialog._last_result and not dialog._is_cancelled:
+                self._on_voice_gender_check_completed(dialog._last_result, "")
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Lỗi phân vai AI", f"Đã xảy ra lỗi khi khởi động phân vai AI:\n{exc}")
+        finally:
+            if button is not None:
+                button.setEnabled(True)
+                button.setText("🎙️ Phân vai AI")
+            self._voice_gender_progress_dialog = None
+            self.refresh_ui_state()
 
     def _finish_voice_gender_check_worker(self, worker):
         if getattr(self, "_voice_gender_check_worker", None) is worker:
@@ -414,7 +429,7 @@ class VoiceGenderMixin:
     def _on_voice_gender_check_completed(self, result, error, save_history=True, history_entry_id=""):
         button = getattr(self, "voice_gender_check_btn", None)
         if button is not None:
-            button.setText("Kiểm tra giọng nói")
+            button.setText("🎙️ Phân vai AI")
             button.setEnabled(True)
         if error:
             QMessageBox.critical(self, "Kiểm tra giọng nói thất bại", str(error))
@@ -1195,6 +1210,30 @@ class VoiceGenderMixin:
             self.log("[Pipeline] Đang tiến hành tạo lồng tiếng giọng nói (TTS) theo phân vai...")
             self.run_voiceover_with_progress(target_stage="full")
 
+    def start_smart_video_flow(self):
+        """Kích hoạt luồng TẠO VIDEO THÔNG MINH (Quét âm thanh + Mặt nạ động + Lọc Watermark).
+
+        Tích hợp độc lập 3 giải pháp không can thiệp luồng cũ:
+        1. Bóc tách bằng âm thanh (SenseVoice / Whisper)
+        2. Mặt nạ mờ Động theo thời gian (Dynamic Time-based Mask) & Hộp che bo góc
+        3. Bộ lọc Blacklist chống dính watermark và chữ dọc mép trái
+        """
+        video_path = self._normalize_local_file_path(
+            self.video_path_edit.text().strip() if hasattr(self, "video_path_edit") else ""
+        )
+        existing_segs = []
+        if hasattr(self, "subtitles_data") and self.subtitles_data:
+            existing_segs = getattr(self, "subtitles_data", [])
+
+        from ui.dialogs.smart_video_dialog import SmartVideoDialog
+        dialog = SmartVideoDialog(
+            self,
+            video_path=video_path,
+            workspace_root=str(self.workspace_root),
+            existing_segments=existing_segs,
+        )
+        dialog.exec()
+
     def start_pipeline_b_flow(self, preselected_master_id: str = ""):
         """Kích hoạt luồng Pipeline B: Tạo video tự động từ Master Data đã kiểm duyệt.
 
@@ -1242,7 +1281,9 @@ class VoiceGenderMixin:
         voice_config = None
         subtitle_config = None
         brand_logo_settings = None
+        frame_border_settings = None
         watermark_settings = None
+        video_scale_percent = None
         if target_dataset is None:
             init_orig = int(self.audio_a1_volume_slider.value()) if hasattr(self, "audio_a1_volume_slider") else 50
             init_tts = int(self.audio_a2_volume_slider.value()) if hasattr(self, "audio_a2_volume_slider") else 100
@@ -1261,7 +1302,9 @@ class VoiceGenderMixin:
             voice_config = dialog.get_voice_mapping_config()
             subtitle_config = dialog.get_subtitle_config()
             brand_logo_settings = dialog.get_brand_logo_settings()
+            frame_border_settings = dialog.get_frame_border_settings()
             watermark_settings = dialog.get_watermark_settings()
+            video_scale_percent = dialog.get_video_scale_percent()
 
         if not target_dataset:
             QMessageBox.warning(self, "Pipeline B", "Chưa chọn bản Master Data nào.")
@@ -1293,29 +1336,55 @@ class VoiceGenderMixin:
             creator_config.voice_config = voice_config
 
         # Nạp dự phòng từ QSettings nếu chưa có từ dialog
-        if brand_logo_settings is None or watermark_settings is None:
-            branding_st = QSettings("TankVideo", "TankVideoStudio")
-            if brand_logo_settings is None:
-                enable_l = branding_st.value("branding/enable_logo", False, type=bool)
-                l_path = branding_st.value("branding/logo_path", "", type=str)
-                brand_logo_settings = {
-                    "enable": enable_l and bool(l_path),
-                    "path": l_path,
-                    "position": branding_st.value("branding/logo_pos", "top_left", type=str),
-                    "size_percent": branding_st.value("branding/logo_size", 15, type=int),
-                    "opacity": float(branding_st.value("branding/logo_opacity", 100, type=int)) / 100.0,
-                }
-            if watermark_settings is None:
-                enable_w = branding_st.value("branding/enable_watermark", False, type=bool)
-                w_text = branding_st.value("branding/watermark_text", "", type=str)
-                watermark_settings = {
-                    "enable": enable_w and bool(w_text),
-                    "text": w_text,
-                    "position": branding_st.value("branding/watermark_pos", "center", type=str),
-                    "font_size": branding_st.value("branding/watermark_size", 36, type=int),
-                    "opacity": float(branding_st.value("branding/watermark_opacity", 35, type=int)) / 100.0,
-                    "color": "#FFFFFF",
-                }
+        branding_st = QSettings("TankVideo", "TankVideoStudio")
+        if brand_logo_settings is None:
+            enable_l = branding_st.value("branding/enable_logo", False, type=bool)
+            l_path = branding_st.value("branding/logo_path", "", type=str)
+            brand_logo_settings = {
+                "enable": enable_l and bool(l_path),
+                "path": l_path,
+                "position": branding_st.value("branding/logo_pos", "top_left", type=str),
+                "size_percent": branding_st.value("branding/logo_size", 15, type=int),
+                "opacity": float(branding_st.value("branding/logo_opacity", 100, type=int)) / 100.0,
+            }
+        if frame_border_settings is None:
+            enable_fb = branding_st.value("branding/enable_frame_border", False, type=bool)
+            fb_top = branding_st.value("branding/frame_border_top_path", "", type=str)
+            fb_bot = branding_st.value("branding/frame_border_bottom_path", "", type=str)
+            fb_legacy = branding_st.value("branding/frame_border_path", "", type=str)
+            frame_border_settings = {
+                "enable": enable_fb and (bool(fb_top) or bool(fb_bot) or bool(fb_legacy)),
+                "top_path": fb_top or fb_legacy,
+                "bottom_path": fb_bot,
+                "path": fb_top or fb_legacy,
+                "opacity": float(branding_st.value("branding/frame_border_opacity", 100, type=int)) / 100.0,
+            }
+        if watermark_settings is None:
+            enable_w = branding_st.value("branding/enable_watermark", False, type=bool)
+            w_text = branding_st.value("branding/watermark_text", "", type=str)
+            watermark_settings = {
+                "enable": enable_w and bool(w_text),
+                "text": w_text,
+                "position": branding_st.value("branding/watermark_pos", "center", type=str),
+                "font_size": branding_st.value("branding/watermark_size", 36, type=int),
+                "opacity": float(branding_st.value("branding/watermark_opacity", 35, type=int)) / 100.0,
+                "color": "#FFFFFF",
+            }
+        if video_scale_percent is None:
+            video_scale_percent = branding_st.value("branding/video_scale_percent", 100, type=int)
+
+        # Áp dụng cấu hình Khung viền video trang trí
+        if frame_border_settings:
+            creator_config.enable_frame_border = bool(frame_border_settings.get("enable", False))
+            creator_config.frame_border_top_path = str(frame_border_settings.get("top_path", "") or frame_border_settings.get("path", ""))
+            creator_config.frame_border_bottom_path = str(frame_border_settings.get("bottom_path", ""))
+            creator_config.frame_border_path = creator_config.frame_border_top_path or creator_config.frame_border_bottom_path
+            creator_config.frame_border_opacity = float(frame_border_settings.get("opacity", 1.0))
+            creator_config.frame_border_top_height = int(frame_border_settings.get("top_height", 0) or 0)
+            creator_config.frame_border_bottom_height = int(frame_border_settings.get("bottom_height", 0) or 0)
+
+        # Áp dụng cấu hình Thu phóng video kiểu CapCut (100% - 150%)
+        creator_config.video_scale_percent = int(video_scale_percent or 100)
 
         # Áp dụng cấu hình Logo thương hiệu & Watermark bản quyền
         if brand_logo_settings:

@@ -7,16 +7,16 @@ Thiết kế Cyber Engine UI hiện đại theo phong cách Quét Video Pro:
 """
 
 import os
+import re
 import sys
 import threading
 import time
-import json
 import csv
 import urllib.request
 from typing import Optional, List, Dict, Any
 
-from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QByteArray, QSize, QSettings
-from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QImage, QPainter, QPainterPath
+from PySide6.QtCore import Qt, Signal, QTimer, QThread, QSettings
+from PySide6.QtGui import QColor, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -46,19 +45,14 @@ from PySide6.QtWidgets import (
 
 from app.services.cookie_storage_service import (
     get_saved_douyin_cookies,
-    save_douyin_cookies,
-    clear_saved_douyin_cookies,
-    get_douyin_cookie_summary,
     save_platform_cookies,
     get_saved_platform_cookies,
     get_platform_cookie_summary,
     clear_saved_platform_cookies,
-    detect_cookie_platform,
     PLATFORM_DISPLAY_NAMES,
     PLATFORM_DOMAINS,
     _get_setting,
 )
-from app.services.browser_profile_service import get_installed_browsers_with_profiles
 from ui.dialogs.browser_profile_dialog import BrowserProfileDialog, CookieExpiredDialog
 from app.services.hongguo_downloader_service import (
     HongguoScanWorker,
@@ -354,215 +348,294 @@ class DownloadWorker(QThread):
         self,
         selected_items: List[tuple],
         output_dir: str,
-        auto_delogo_bilibili: bool = False,
-        auto_delogo_watermark: bool = False,
+        threads: int = 8,
+        platform: str = "",
         parent=None,
     ):
         """selected_items: list of (row_idx, video_dict)"""
         super().__init__(parent)
         self.selected_items = selected_items
         self.output_dir = output_dir
-        self.auto_delogo_bilibili = auto_delogo_bilibili
-        self.auto_delogo_watermark = auto_delogo_watermark
+        self.threads = max(1, min(32, int(threads or 8)))
+        self.platform = platform
         self._is_cancelled = False
+        self._executor = None
+        self._lock = threading.Lock()
+        self._active_services = []
 
     def cancel(self):
         self._is_cancelled = True
-
-    def _apply_delogo_cleanup(self, video_path: str, delogo_bili: bool = True, delogo_wm: bool = True) -> bool:
-        """Khử sạch logo Bilibili và watermark bản quyền trên file video vừa tải về."""
-        try:
-            if not video_path or not os.path.isfile(video_path):
-                return False
-            if not delogo_bili and not delogo_wm:
-                return False
-
-            from app.services.video_export_service import (
-                _resolve_ffmpeg,
-                probe_video_dimensions,
-                build_delogo_filters,
-            )
-            ffmpeg = _resolve_ffmpeg()
-            vid_w, vid_h = probe_video_dimensions(video_path)
-
-            filters, out_v = build_delogo_filters(
-                vid_w=vid_w,
-                vid_h=vid_h,
-                delogo_bilibili=delogo_bili,
-                delogo_watermark=delogo_wm,
-                current_v="0:v",
-            )
-            if not filters:
-                return False
-
-            dir_name = os.path.dirname(video_path)
-            base_name, ext = os.path.splitext(os.path.basename(video_path))
-            temp_clean_path = os.path.join(dir_name, f"{base_name}_delogo_temp{ext}")
-
-            cmd = [
-                ffmpeg, "-y",
-                "-i", video_path,
-                "-filter_complex", ";\n".join(filters),
-                "-map", f"[{out_v}]",
-                "-map", "0:a:0?",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "20",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "copy",
-                temp_clean_path,
-            ]
-            import subprocess
-            kwargs = {"capture_output": True}
-            if os.name == "nt":
-                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-            proc = subprocess.run(cmd, **kwargs)
-            if proc.returncode == 0 and os.path.isfile(temp_clean_path) and os.path.getsize(temp_clean_path) > 10240:
+        with self._lock:
+            for s in list(self._active_services):
                 try:
-                    os.replace(temp_clean_path, video_path)
+                    s.cancel()
                 except Exception:
-                    os.remove(video_path)
-                    os.rename(temp_clean_path, video_path)
-                print(f"[DownloadWorker] Delogo cleanup succeeded for: {os.path.basename(video_path)}")
-                return True
-            else:
-                if os.path.isfile(temp_clean_path):
+                    pass
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _download_single_item(self, row_idx: int, v: dict, user_agent: str, cookie_header: str) -> bool:
+        if self._is_cancelled:
+            self.sig_row_status.emit(row_idx, "⏹️ Đã dừng")
+            return False
+
+        vid_id = str(v.get("id") or "").strip()
+        title = v.get("title") or f"video_{vid_id or (row_idx + 1)}"
+        safe_title = "".join(c for c in str(title) if c not in r'\/:*?"<>|').strip()
+        clean_title = safe_title[:60]
+        if not clean_title:
+            clean_title = f"video_{vid_id or (row_idx + 1)}"
+
+        # Đặt tên file có kèm video ID để các tập trong cùng một bộ phim / drama không bị trùng tên hay ghi đè
+        if vid_id and vid_id not in clean_title:
+            target_filename = f"{clean_title}_{vid_id}.mp4"
+        else:
+            target_filename = f"{clean_title}.mp4"
+        out_path = os.path.join(self.output_dir, target_filename)
+
+        # Kiểm tra nếu file của CHÍNH VIDEO NÀY đã có sẵn hợp lệ (loại trừ các file stream rời .f*.mp4, .part, .m4s)
+        existing_file = None
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 102400 and not re.search(r'\.f\d+\.mp4$', out_path):
+            existing_file = out_path
+        elif vid_id and os.path.isdir(self.output_dir):
+            # Tìm file trong thư mục chứa đúng ID của video này (ví dụ clean_title_7652666201897782564.mp4 hoặc [7652666201897782564].mp4)
+            for fname in os.listdir(self.output_dir):
+                if fname.endswith(".mp4") and vid_id in fname and not re.search(r'\.f\d+\.mp4$', fname):
+                    cand = os.path.join(self.output_dir, fname)
+                    if os.path.isfile(cand) and os.path.getsize(cand) > 102400:
+                        existing_file = cand
+                        break
+
+        if existing_file:
+            self.sig_row_status.emit(row_idx, "Đã có sẵn ✓")
+            return True
+
+        # Dọn dẹp trước các file stream dở dang của video này tránh để lại file câm tiếng
+        if os.path.isdir(self.output_dir):
+            for fname in os.listdir(self.output_dir):
+                if fname.endswith(".part") or fname.endswith(".m4s") or re.search(r'\.f\d+\.(mp4|m4a)$', fname):
+                    if (vid_id and vid_id in fname) or (clean_title and clean_title in fname):
+                        try:
+                            os.remove(os.path.join(self.output_dir, fname))
+                        except Exception:
+                            pass
+
+        self.sig_row_status.emit(row_idx, "⏳ Đang kết nối...")
+        downloaded = False
+        direct_url = v.get("direct_url")
+
+        # 1. Thử direct CDN stream download nếu có
+        if direct_url:
+            temp_out = out_path + ".part"
+            try:
+                req = urllib.request.Request(
+                    direct_url,
+                    headers={
+                        "User-Agent": user_agent,
+                        "Referer": "https://www.douyin.com/",
+                        "Cookie": cookie_header,
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp, open(temp_out, "wb") as f_out:
+                    content_len = int(resp.headers.get("Content-Length", 0) or 0)
+                    dl_bytes = 0
+                    last_emit = 0.0
+                    while True:
+                        if self._is_cancelled:
+                            break
+                        chunk = resp.read(128 * 1024)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                        dl_bytes += len(chunk)
+                        now = time.time()
+                        if now - last_emit > 0.35:
+                            last_emit = now
+                            if content_len > 0:
+                                pct = (dl_bytes / content_len) * 100
+                                down_mb = dl_bytes / (1024 * 1024)
+                                tot_mb = content_len / (1024 * 1024)
+                                self.sig_row_status.emit(row_idx, f"⏳ {pct:.0f}% ({down_mb:.1f}/{tot_mb:.1f}M)")
+                            else:
+                                down_mb = dl_bytes / (1024 * 1024)
+                                self.sig_row_status.emit(row_idx, f"⏳ {down_mb:.1f}MB")
+
+                if self._is_cancelled:
+                    if os.path.exists(temp_out):
+                        try:
+                            os.remove(temp_out)
+                        except Exception:
+                            pass
+                    self.sig_row_status.emit(row_idx, "⏹️ Đã dừng")
+                    return False
+
+                if os.path.isfile(temp_out) and os.path.getsize(temp_out) > 10240:
+                    if os.path.exists(out_path):
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            pass
+                    os.rename(temp_out, out_path)
+                    downloaded = True
+            except Exception:
+                if os.path.exists(temp_out):
                     try:
-                        os.remove(temp_clean_path)
+                        os.remove(temp_out)
                     except Exception:
                         pass
-        except Exception as exc:
-            print(f"[DownloadWorker] Delogo cleanup notice: {exc}")
-        return False
+                downloaded = False
+
+        # 2. Fallback sang VideoDownloaderService (yt-dlp)
+        if not downloaded and not self._is_cancelled:
+            svc = None
+            try:
+                from app.services.video_downloader_service import VideoDownloaderService
+                svc = VideoDownloaderService(output_root=self.output_dir)
+                with self._lock:
+                    self._active_services.append(svc)
+
+                target_url = v.get("url") or v.get("webpage_url") or ""
+                last_emit = [0.0]
+
+                def _on_sub_dl_progress(p):
+                    if self._is_cancelled:
+                        return
+                    now = time.time()
+                    if now - last_emit[0] < 0.35 and p.status != "finished":
+                        return
+                    last_emit[0] = now
+
+                    pct = getattr(p, "percent", 0.0) or 0.0
+                    speed = getattr(p, "speed", 0.0) or 0.0
+                    dl_bytes = getattr(p, "downloaded_bytes", 0) or 0
+                    tot_bytes = getattr(p, "total_bytes", 0) or 0
+
+                    speed_txt = ""
+                    if speed > 1024 * 1024:
+                        speed_txt = f" - {speed / (1024*1024):.1f}MB/s"
+                    elif speed > 1024:
+                        speed_txt = f" - {speed / 1024:.0f}KB/s"
+
+                    if tot_bytes > 0:
+                        down_mb = dl_bytes / (1024 * 1024)
+                        tot_mb = tot_bytes / (1024 * 1024)
+                        self.sig_row_status.emit(row_idx, f"⏳ {pct:.0f}% ({down_mb:.1f}/{tot_mb:.1f}M{speed_txt})")
+                    elif dl_bytes > 0:
+                        down_mb = dl_bytes / (1024 * 1024)
+                        self.sig_row_status.emit(row_idx, f"⏳ {down_mb:.1f}MB{speed_txt}")
+                    else:
+                        self.sig_row_status.emit(row_idx, "⏳ Đang tải...")
+
+                res = svc.download_single(
+                    target_url,
+                    self.output_dir,
+                    progress_callback=_on_sub_dl_progress,
+                    auto_delogo_bilibili=False,
+                    auto_delogo_watermark=False,
+                )
+                last_err = ""
+                if res.get("success"):
+                    downloaded = True
+                    if res.get("files") and len(res.get("files")) > 0:
+                        f_cand = res.get("files")[0]
+                        if os.path.isfile(f_cand) and os.path.getsize(f_cand) > 10240:
+                            out_path = f_cand
+                else:
+                    err_txt = res.get("error", "")
+                    last_err = err_txt
+                    print(f"[DownloadWorker] Tải video thất bại row {row_idx}: {err_txt}")
+            except Exception as exc:
+                last_err = str(exc)
+                print(f"[DownloadWorker] Ngoại lệ khi tải row {row_idx}: {exc}")
+                downloaded = False
+            finally:
+                if svc:
+                    with self._lock:
+                        if svc in self._active_services:
+                            self._active_services.remove(svc)
+
+        if self._is_cancelled:
+            # Dọn dẹp file tạm dở dang nếu người dùng bấm Dừng
+            if os.path.isdir(self.output_dir):
+                prefix = safe_title[:20] if len(safe_title) >= 20 else safe_title
+                for fname in os.listdir(self.output_dir):
+                    if fname.endswith(".part") or fname.endswith(".m4s") or re.search(r'\.f\d+\.(mp4|m4a)$', fname):
+                        if (safe_title and safe_title in fname) or (prefix and prefix in fname):
+                            try:
+                                os.remove(os.path.join(self.output_dir, fname))
+                            except Exception:
+                                pass
+            self.sig_row_status.emit(row_idx, "⏹️ Đã dừng")
+            return False
+
+        if downloaded:
+            self.sig_row_status.emit(row_idx, "✅ Hoàn thành")
+            return True
+        else:
+            # Dọn dẹp file tạm dở dang nếu tải thất bại
+            if os.path.isdir(self.output_dir):
+                prefix = safe_title[:20] if len(safe_title) >= 20 else safe_title
+                for fname in os.listdir(self.output_dir):
+                    if fname.endswith(".part") or fname.endswith(".m4s") or re.search(r'\.f\d+\.(mp4|m4a)$', fname):
+                        if (safe_title and safe_title in fname) or (prefix and prefix in fname):
+                            try:
+                                os.remove(os.path.join(self.output_dir, fname))
+                            except Exception:
+                                pass
+            reason = ""
+            if "expected" in last_err or "bytes read" in last_err:
+                reason = " (Đứt mạng CDN)"
+            elif "412" in last_err or "blocked" in last_err:
+                reason = " (Bị chặn 412)"
+            elif "403" in last_err:
+                reason = " (Cần Cookie)"
+            self.sig_row_status.emit(row_idx, f"❌ Lỗi tải{reason}")
+            return False
 
     def run(self):
         os.makedirs(self.output_dir, exist_ok=True)
         total = len(self.selected_items)
-        success = 0
+        if total == 0:
+            self.sig_finished.emit(0, 0, False)
+            return
 
         # Load Douyin cookies and user agent
         custom_cookies, _, ua = get_saved_douyin_cookies()
         cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in custom_cookies) if custom_cookies else ""
         user_agent = ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-        for idx, (row_idx, v) in enumerate(self.selected_items):
-            if self._is_cancelled:
-                self.sig_row_status.emit(row_idx, "⏹️ Đã dừng")
-                self.sig_progress.emit(idx, total, "Đã dừng tải video.")
-                break
+        self.sig_progress.emit(0, total, f"Bắt đầu tải đa luồng ({self.threads} luồng) {total} video...")
 
-            title = v.get("title") or f"video_{v.get('id', idx+1)}"
-            clean_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:60] or f"video_{v.get('id')}"
-            out_path = os.path.join(self.output_dir, f"{clean_title}.mp4")
+        completed = 0
+        success = 0
 
-            self.sig_row_status.emit(row_idx, "⏳ Đang tải...")
-            self.sig_progress.emit(idx + 1, total, f"Đang tải {idx+1}/{total}: {clean_title}")
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            self._executor = executor
+            future_to_item = {
+                executor.submit(self._download_single_item, row_idx, v, user_agent, cookie_header): (row_idx, v)
+                for row_idx, v in self.selected_items
+            }
 
-            downloaded = False
-            direct_url = v.get("direct_url")
-
-            # Try direct CDN stream download first
-            if direct_url:
+            for future in as_completed(future_to_item):
+                if self._is_cancelled:
+                    break
                 try:
-                    req = urllib.request.Request(
-                        direct_url,
-                        headers={
-                            "User-Agent": user_agent,
-                            "Referer": "https://www.douyin.com/",
-                            "Cookie": cookie_header,
-                        }
-                    )
-                    with urllib.request.urlopen(req, timeout=30) as resp, open(out_path, "wb") as f_out:
-                        while True:
-                            if self._is_cancelled:
-                                break
-                            chunk = resp.read(64 * 1024)
-                            if not chunk:
-                                break
-                            f_out.write(chunk)
-
-                    if self._is_cancelled:
-                        if os.path.exists(out_path):
-                            try:
-                                os.remove(out_path)
-                            except Exception:
-                                pass
-                        self.sig_row_status.emit(row_idx, "⏹️ Đã hủy")
-                        break
-
-                    if os.path.exists(out_path) and os.path.getsize(out_path) > 10240:
-                        downloaded = True
+                    ok = future.result()
+                    if ok:
+                        success += 1
                 except Exception:
-                    downloaded = False
-
-            # Fallback to VideoDownloaderService if not cancelled
-            if not downloaded and not self._is_cancelled:
-                try:
-                    from app.services.video_downloader_service import VideoDownloaderService
-                    svc = VideoDownloaderService(output_root=self.output_dir)
-                    res = svc.download_single(
-                        v.get("url"),
-                        self.output_dir,
-                        auto_delogo_bilibili=False,
-                        auto_delogo_watermark=False,
-                    )
-                    if res.get("success"):
-                        downloaded = True
-                        if res.get("files") and len(res.get("files")) > 0:
-                            f_cand = res.get("files")[0]
-                            if os.path.isfile(f_cand):
-                                out_path = f_cand
-                except Exception:
-                    downloaded = False
-
-            if self._is_cancelled:
-                if os.path.exists(out_path):
-                    try:
-                        os.remove(out_path)
-                    except Exception:
-                        pass
-                self.sig_row_status.emit(row_idx, "⏹️ Đã hủy")
-                break
-
-            if downloaded:
-                actual_file = out_path if (os.path.exists(out_path) and os.path.getsize(out_path) > 10240) else None
-                if not actual_file and os.path.isdir(self.output_dir):
-                    for f in os.listdir(self.output_dir):
-                        if f.endswith(".mp4") and clean_title[:20].lower() in f.lower():
-                            fp = os.path.join(self.output_dir, f)
-                            if os.path.getsize(fp) > 10240:
-                                actual_file = fp
-                                break
-
-                # Khử Logo Bilibili & Watermark nếu được bật
-                v_url = (v.get("url") or "") + " " + (v.get("webpage_url") or "") + " " + (v.get("id") or "")
-                is_bilibili = (
-                    "bilibili" in v_url.lower()
-                    or "b23.tv" in v_url.lower()
-                    or v.get("platform") == "bilibili"
-                    or (hasattr(self, "platform") and self.platform == "bilibili")
+                    pass
+                completed += 1
+                self.sig_progress.emit(
+                    completed,
+                    total,
+                    f"Đang tải {completed}/{total} video (Thành công: {success} | Đa luồng: {self.threads})..."
                 )
 
-                delogo_bili = self.auto_delogo_bilibili and (is_bilibili or not v.get("platform"))
-                delogo_wm = self.auto_delogo_watermark and (is_bilibili or not v.get("platform"))
-
-                did_delogo = False
-                if actual_file and (delogo_bili or delogo_wm):
-                    self.sig_row_status.emit(row_idx, "🧹 Đang xóa logo...")
-                    did_delogo = self._apply_delogo_cleanup(
-                        actual_file,
-                        delogo_bili=delogo_bili,
-                        delogo_wm=delogo_wm,
-                    )
-
-                success += 1
-                status_msg = "✅ Hoàn thành (Đã xóa logo)" if did_delogo else "✅ Hoàn thành"
-                self.sig_row_status.emit(row_idx, status_msg)
-            else:
-                self.sig_row_status.emit(row_idx, "❌ Lỗi tải")
-
-            time.sleep(0.15)
+        if self._is_cancelled:
+            for row_idx, _ in self.selected_items:
+                # Nếu còn luồng nào chưa chạy xong thì dừng
+                pass
 
         self.sig_finished.emit(success, total, self._is_cancelled)
 
@@ -964,37 +1037,6 @@ class VideoDownloaderDialog(QDialog):
 
         left_content_layout.addWidget(card_cookie)
 
-        # --- Card 4: Tự Động Xóa Logo & Watermark (Delogo AI) ---
-        card_delogo = self._create_card("🧹 TỰ ĐỘNG XÓA LOGO & WATERMARK (DELOGO AI)")
-        dl_layout = card_delogo.layout()
-
-        self.chk_auto_delogo_bili = QCheckBox("🎯 Tự động xóa Logo Bilibili (Góc trên cùng bên phải)")
-        self.chk_auto_delogo_bili.setChecked(False)
-        self.chk_auto_delogo_bili.setStyleSheet("color: #ff9d42; font-weight: bold; font-size: 11px;")
-        dl_layout.addWidget(self.chk_auto_delogo_bili)
-
-        self.chk_auto_delogo_wm = QCheckBox("🌊 Tự động làm mờ dải Watermark bản quyền (ở dưới)")
-        self.chk_auto_delogo_wm.setChecked(False)
-        self.chk_auto_delogo_wm.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
-        dl_layout.addWidget(self.chk_auto_delogo_wm)
-
-        lbl_delogo_note = QLabel(
-            "💡 Chỉ bật khi video gốc thực sự có logo Bilibili hoặc dải chữ watermark cần xóa, "
-            "tránh chèn dải che mờ không cần thiết lên video."
-        )
-        lbl_delogo_note.setWordWrap(True)
-        lbl_delogo_note.setStyleSheet(f"font-size: 10px; color: {self._TEXT_MUTED}; font-style: italic;")
-        dl_layout.addWidget(lbl_delogo_note)
-
-        # QSettings persistence for downloader delogo options (mặc định False)
-        dl_settings = QSettings("TankVideo", "TankVideoStudio")
-        self.chk_auto_delogo_bili.setChecked(dl_settings.value("downloader/auto_delogo_bilibili", False, type=bool))
-        self.chk_auto_delogo_wm.setChecked(dl_settings.value("downloader/auto_delogo_watermark", False, type=bool))
-        self.chk_auto_delogo_bili.toggled.connect(lambda v: dl_settings.setValue("downloader/auto_delogo_bilibili", v))
-        self.chk_auto_delogo_wm.toggled.connect(lambda v: dl_settings.setValue("downloader/auto_delogo_watermark", v))
-
-        left_content_layout.addWidget(card_delogo)
-
         # --- Action Buttons: BẮT ĐẦU QUÉT & DỪNG QUÉT ---
         act_row = QHBoxLayout()
         act_row.setSpacing(8)
@@ -1020,14 +1062,14 @@ class VideoDownloaderDialog(QDialog):
         self.btn_stop_scan = QPushButton("🛑 DỪNG")
         self.btn_stop_scan.setFixedHeight(44)
         self.btn_stop_scan.setEnabled(False)
-        self.btn_stop_scan.setStyleSheet(f"""
-            QPushButton {{
+        self.btn_stop_scan.setStyleSheet("""
+            QPushButton {
                 background: #7f1d1d; border: 1px solid #991b1b;
                 border-radius: 8px; color: #fecaca;
                 font-size: 12px; font-weight: 700;
-            }}
-            QPushButton:hover {{ background: #991b1b; color: #ffffff; }}
-            QPushButton:disabled {{ background: #1e293b; border-color: #334155; color: #64748b; }}
+            }
+            QPushButton:hover { background: #991b1b; color: #ffffff; }
+            QPushButton:disabled { background: #1e293b; border-color: #334155; color: #64748b; }
         """)
         self.btn_stop_scan.clicked.connect(self._on_stop_scan)
         act_row.addWidget(self.btn_stop_scan, 1)
@@ -1180,6 +1222,23 @@ class VideoDownloaderDialog(QDialog):
 
         row2.addStretch(1)
 
+        # Bộ chọn số luồng tải đa luồng (Multi-threading) giống Hồng Quả
+        lbl_th = QLabel("⚡ Luồng tải:")
+        lbl_th.setStyleSheet("font-size: 11px; font-weight: 700; color: #ff9d42;")
+        row2.addWidget(lbl_th)
+
+        self.threads_spin = QSpinBox(self)
+        self.threads_spin.setRange(1, 32)
+        dl_settings = QSettings("TankVideo", "TankVideoStudio")
+        saved_threads = dl_settings.value("downloader/concurrent_threads", 8, type=int)
+        self.threads_spin.setValue(max(1, min(32, int(saved_threads or 8))))
+        self.threads_spin.setFixedWidth(65)
+        self.threads_spin.setFixedHeight(36)
+        self.threads_spin.setStyleSheet(self._input_style())
+        self.threads_spin.setToolTip("Số video tải đồng thời song song (Đa luồng giống Hồng Quả, từ 1 đến 32 luồng)")
+        self.threads_spin.valueChanged.connect(lambda v: dl_settings.setValue("downloader/concurrent_threads", v))
+        row2.addWidget(self.threads_spin)
+
         # Big Download Button
         self.btn_download_selected = QPushButton("📥 TẢI VIDEO ĐÃ CHỌN (0)")
         self.btn_download_selected.setFixedHeight(36)
@@ -1234,6 +1293,39 @@ class VideoDownloaderDialog(QDialog):
 
         tb_box.addLayout(row2)
 
+        # Download progress bar & status container (trực quan trên đầu bảng)
+        self.dl_progress_container = QWidget()
+        dl_p_layout = QVBoxLayout(self.dl_progress_container)
+        dl_p_layout.setContentsMargins(0, 4, 0, 4)
+        dl_p_layout.setSpacing(4)
+
+        dl_info_row = QHBoxLayout()
+        self.dl_status_lbl = QLabel("Đang chuẩn bị tải...")
+        self.dl_status_lbl.setStyleSheet(f"color: {self._PRIMARY}; font-size: 12px; font-weight: bold;")
+        dl_info_row.addWidget(self.dl_status_lbl)
+
+        self.dl_percent_lbl = QLabel("0%")
+        self.dl_percent_lbl.setStyleSheet("color: #38bdf8; font-size: 12px; font-weight: bold;")
+        dl_info_row.addStretch()
+        dl_info_row.addWidget(self.dl_percent_lbl)
+        dl_p_layout.addLayout(dl_info_row)
+
+        self.dl_progress_bar = QProgressBar()
+        self.dl_progress_bar.setFixedHeight(8)
+        self.dl_progress_bar.setTextVisible(False)
+        self.dl_progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: #0f172a; border-radius: 4px; border: 1px solid #1e293b;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {self._PRIMARY}, stop:1 #fb923c);
+                border-radius: 3px;
+            }}
+        """)
+        dl_p_layout.addWidget(self.dl_progress_bar)
+        self.dl_progress_container.hide()
+        tb_box.addWidget(self.dl_progress_container)
+
         # ---- RESULTS TABLE (QTableWidget) ----
         self.table = QTableWidget(self)
         self.table.setColumnCount(8)
@@ -1285,7 +1377,7 @@ class VideoDownloaderDialog(QDialog):
         header_view.setSectionResizeMode(6, QHeaderView.Fixed)
         self.table.setColumnWidth(6, 120)
         header_view.setSectionResizeMode(7, QHeaderView.Fixed)
-        self.table.setColumnWidth(7, 105)
+        self.table.setColumnWidth(7, 160)
 
         # REAL, CLICKABLE HEADER CHECKBOX OVER SECTION 0 (DEFAULT: UNCHECKED)
         self.header_cb = QCheckBox(self.table.horizontalHeader())
@@ -1616,12 +1708,12 @@ class VideoDownloaderDialog(QDialog):
         self.hg_log_edit = QTextEdit(self)
         self.hg_log_edit.setReadOnly(True)
         self.hg_log_edit.setFixedHeight(95)
-        self.hg_log_edit.setStyleSheet(f"""
-            QTextEdit {{
+        self.hg_log_edit.setStyleSheet("""
+            QTextEdit {
                 background: #070b14; border: 1px solid #141d2e;
                 border-radius: 4px; color: #cbd5e1; font-size: 10px;
                 font-family: Consolas, monospace; line-height: 1.3;
-            }}
+            }
         """)
         lc_lay.addWidget(self.hg_log_edit)
         page_layout.addWidget(log_card)
@@ -2168,6 +2260,12 @@ class VideoDownloaderDialog(QDialog):
             QMessageBox.warning(self, "Quét Video", "Vui lòng nhập Link kênh hoặc Link video muốn quét!")
             return
 
+        from app.services.video_downloader_service import extract_url_from_text
+        cleaned_url = extract_url_from_text(url)
+        if cleaned_url:
+            url = cleaned_url
+            self.url_input.setText(cleaned_url)
+
         # Auto save cookie if user typed into cookie_input
         ck_text = self.cookie_input.toPlainText().strip()
         if ck_text:
@@ -2360,7 +2458,7 @@ class VideoDownloaderDialog(QDialog):
         ):
             self.scan_status_lbl.setText("⚠️ Cookie Douyin đã hết hạn hoặc phiên không hợp lệ!")
             self.header_status_badge.setText("⚠️ Cookie Hết Hạn")
-            self.header_status_badge.setStyleSheet(f"""
+            self.header_status_badge.setStyleSheet("""
                 background: #3a1118; border: 1px solid #ef4444;
                 color: #f87171; font-size: 11px; font-weight: 700;
                 padding: 6px 14px; border-radius: 6px;
@@ -2684,13 +2782,18 @@ class VideoDownloaderDialog(QDialog):
         self.scan_progress.show()
         self.scan_progress.setRange(0, len(selected_items))
         self.scan_progress.setValue(0)
-        auto_bili = self.chk_auto_delogo_bili.isChecked() if hasattr(self, "chk_auto_delogo_bili") else False
-        auto_wm = self.chk_auto_delogo_wm.isChecked() if hasattr(self, "chk_auto_delogo_wm") else False
+        threads = self.threads_spin.value() if hasattr(self, "threads_spin") else 8
+        if hasattr(self, "dl_progress_container"):
+            self.dl_progress_container.show()
+            self.dl_progress_bar.setRange(0, len(selected_items))
+            self.dl_progress_bar.setValue(0)
+            self.dl_percent_lbl.setText("0%")
+            self.dl_status_lbl.setText(f"📥 Đang tải đa luồng ({threads} luồng) {len(selected_items)} video...")
         self._download_worker = DownloadWorker(
             selected_items,
             out_dir,
-            auto_delogo_bilibili=auto_bili,
-            auto_delogo_watermark=auto_wm,
+            threads=threads,
+            platform=getattr(self, "_selected_platform", ""),
             parent=self,
         )
         self._download_worker.sig_row_status.connect(self._on_row_status_update)
@@ -2701,33 +2804,50 @@ class VideoDownloaderDialog(QDialog):
     def _on_stop_download(self):
         if self._download_worker and self._download_worker.isRunning():
             self.scan_status_lbl.setText("🛑 Đang dừng quá trình tải, vui lòng đợi giây lát...")
+            if hasattr(self, "dl_status_lbl"):
+                self.dl_status_lbl.setText("🛑 Đang dừng quá trình tải...")
             self.btn_stop_download.setEnabled(False)
             self._download_worker.cancel()
+            # Đánh dấu các dòng đang chờ sang đã dừng
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, 7)
+                if item and ("chờ" in item.text().lower() or "đang tải" in item.text().lower() or "kết nối" in item.text().lower()):
+                    item.setText("⏹️ Đã dừng")
+                    item.setForeground(QColor("#f43f5e"))
 
     def _on_row_status_update(self, row_idx: int, status_text: str):
         if row_idx < self.table.rowCount():
             item = self.table.item(row_idx, 7)
             if item:
                 item.setText(status_text)
-                if "Hoàn thành" in status_text:
+                if "Hoàn thành" in status_text or "Đã có sẵn" in status_text:
                     item.setForeground(QColor(self._GREEN))
                 elif "Lỗi" in status_text:
                     item.setForeground(QColor(self._RED))
                 elif "dừng" in status_text.lower() or "hủy" in status_text.lower():
                     item.setForeground(QColor("#f43f5e"))
                 else:
-                    item.setForeground(QColor("#f59e0b"))
+                    item.setForeground(QColor("#38bdf8"))
 
     def _on_download_progress(self, current: int, total: int, msg: str):
         self.scan_progress.setValue(current)
         self.scan_status_lbl.setText(msg)
         self.header_status_badge.setText(f"📥 Đang tải {current}/{total}...")
+        if hasattr(self, "dl_progress_bar"):
+            self.dl_progress_bar.setValue(current)
+        if hasattr(self, "dl_status_lbl"):
+            self.dl_status_lbl.setText(msg)
+        if hasattr(self, "dl_percent_lbl"):
+            pct = int((current / total) * 100) if total > 0 else 0
+            self.dl_percent_lbl.setText(f"{pct}% ({current}/{total})")
 
     def _on_download_finished(self, success_count: int, total: int, was_cancelled: bool = False):
         self.btn_download_selected.setEnabled(True)
         self.btn_stop_download.setEnabled(False)
         self.btn_start_scan.setEnabled(True)
         self.scan_progress.hide()
+        if hasattr(self, "dl_progress_container"):
+            self.dl_progress_container.hide()
 
         self._update_table_stats()
 

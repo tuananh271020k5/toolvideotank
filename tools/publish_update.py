@@ -8,7 +8,6 @@ Chỉ cần chạy file này (hoặc bấm publish_update.bat), hệ thống s�
 """
 
 import json
-import os
 import subprocess
 import sys
 import zipfile
@@ -137,7 +136,13 @@ def publish(new_version: str, release_notes: str = "", download_url: str = "", p
     try:
         subprocess.run(["git", "pull", "--rebase"], cwd=str(GIST_REPO_DIR), capture_output=True)
         subprocess.run(["git", "add", "version.json"], cwd=str(GIST_REPO_DIR), check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", f"Release v{new_version}"], cwd=str(GIST_REPO_DIR), check=True, capture_output=True)
+        staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(GIST_REPO_DIR))
+        if staged.returncode == 0:
+            # version.json is identical to what is already published (e.g. the
+            # script was re-run with the same link) — nothing new to commit.
+            print("version.json không thay đổi so với bản đã phát hành — bỏ qua commit.")
+        else:
+            subprocess.run(["git", "commit", "-m", f"Release v{new_version}"], cwd=str(GIST_REPO_DIR), check=True, capture_output=True)
         push_res = subprocess.run(["git", "push", "origin", "main"], cwd=str(GIST_REPO_DIR), capture_output=True, text=True)
         if push_res.returncode != 0:
             push_res = subprocess.run(["git", "push", "origin", "HEAD"], cwd=str(GIST_REPO_DIR), capture_output=True, text=True)
@@ -148,14 +153,14 @@ def publish(new_version: str, release_notes: str = "", download_url: str = "", p
         print(f"Lỗi Git: {e}")
         return False
 
-    print(f"\n=======================================================")
+    print("\n=======================================================")
     print(f"🎉 PHÁT HÀNH THÀNH CÔNG PHIÊN BẢN v{new_version} LÊN MẠNG!")
-    print(f"=======================================================")
+    print("=======================================================")
     print(f"- Gist URL: {GIST_URL}")
     print(f"- Link bộ cài Full (Drive): {data.get('download_url', '')}")
     if data.get("patch_url"):
         print(f"- Link bản vá Patch 1-Click: {data.get('patch_url')}")
-    print(f"- Người dùng khi mở app bấm 'Cập nhật' sẽ cập nhật tự động ngay!")
+    print("- Người dùng khi mở app bấm 'Cập nhật' sẽ cập nhật tự động ngay!")
     return True
 
 
@@ -163,9 +168,9 @@ if __name__ == "__main__":
     cur_ver = get_current_app_version()
     bumped = auto_bump(cur_ver)
 
-    print(f"=======================================================")
-    print(f"   CÔNG CỤ TỰ ĐỘNG PHÁT HÀNH BẢN CẬP NHẬT TANKVIDEO   ")
-    print(f"=======================================================")
+    print("=======================================================")
+    print("   CÔNG CỤ TỰ ĐỘNG PHÁT HÀNH BẢN CẬP NHẬT TANKVIDEO   ")
+    print("=======================================================")
     print(f"Phiên bản hiện tại trong mã nguồn: v{cur_ver}")
 
     if len(sys.argv) > 1:
@@ -185,9 +190,9 @@ if __name__ == "__main__":
     if target_ver != cur_ver:
         set_current_app_version(target_ver)
         print(f"\n✅ Đã cập nhật version.py: {cur_ver} → {target_ver}")
-        print(f"⚠️  BẠN CẦN BUILD LẠI EXE TRƯỚC KHI TIẾP TỤC!")
-        print(f"   Chạy: .\\.venv\\Scripts\\pyinstaller CapCap.spec --noconfirm")
-        input(f"\n   Nhấn ENTER sau khi build xong... ")
+        print("⚠️  BẠN CẦN BUILD LẠI EXE TRƯỚC KHI TIẾP TỤC!")
+        print("   Chạy: .\\.venv\\Scripts\\pyinstaller CapCap.spec --noconfirm")
+        input("\n   Nhấn ENTER sau khi build xong... ")
 
     # Đóng gói bản vá patch.zip (lúc này exe đã chứa version mới)
     patch_path, size_mb = create_patch_zip()

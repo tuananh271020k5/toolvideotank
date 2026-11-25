@@ -3,8 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from PySide6.QtCore import Qt, QUrl, Signal, QObject
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtCore import Signal, QObject
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -14,7 +13,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QComboBox,
     QGroupBox,
-    QFrame,
     QMessageBox,
     QWidget,
 )

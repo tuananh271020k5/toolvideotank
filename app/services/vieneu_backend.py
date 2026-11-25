@@ -15,7 +15,6 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from typing import Any
 
 from app.services.tts_backend import TTSBackend, measure_wav_duration
 
@@ -31,6 +30,11 @@ class VieNeuBackend(TTSBackend):
 
     # Bản đồ ánh xạ cấu hình cứng cho VieNeu (bất biến)
     SUPPORTED_VOICES: dict[str, dict[str, str]] = {
+        "vieneu_cogai_moi": {
+            "name": "Cô Gái Mới",
+            "model_env": "VIENEU_MODEL_COGAI",
+            "default_path": DEFAULT_MODEL_COGAI,
+        },
         "vieneu_cogaihoatbat": {
             "name": "Cô gái hoạt bát",
             "model_env": "VIENEU_MODEL_COGAI",

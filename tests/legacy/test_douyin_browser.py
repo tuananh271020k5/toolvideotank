@@ -10,7 +10,9 @@ import sys
 import time
 
 sys.stdout.reconfigure(line_buffering=True)
-sys.path.insert(0, r"d:\capcap\CapCap")
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 from app.services.video_downloader_service import create_headless_driver
 
 OUTPUT_DIR = r"d:\tooldownload\douyin-downloader\Downloaded"

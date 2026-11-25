@@ -7,10 +7,9 @@ and activate their monthly subscription license key.
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QPixmap
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -24,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.services.license_service import LicenseService, get_hardware_machine_id
+from app.services.license_service import LicenseService
 
 
 class LoginLicenseDialog(QDialog):

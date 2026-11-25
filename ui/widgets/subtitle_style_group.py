@@ -12,11 +12,10 @@ Provides a unified, intuitive, and modern UI component for configuring:
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,

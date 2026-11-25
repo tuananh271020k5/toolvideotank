@@ -2,6 +2,25 @@
   "schema_version": 2,
   "voices": [
     {
+      "id": "vieneu_cogai_moi",
+      "name": "Cô Gái Mới (VieNeu AI)",
+      "provider": "vieneu",
+      "provider_voice": "Cô Gái Mới",
+      "language": "vi",
+      "gender": "female",
+      "tier": "free",
+      "preview_video_url": "",
+      "preview_video_path": "",
+      "preview_audio_url": "",
+      "preview_audio_path": "assets/voices/cogai_moi.wav",
+      "enabled": true,
+      "tags": [
+        "local",
+        "vieneu",
+        "ai"
+      ]
+    },
+    {
       "id": "vieneu_cogaihoatbat",
       "name": "Cô gái hoạt bát",
       "provider": "vieneu",
@@ -550,6 +569,60 @@
       "name": "en_US-arctic-medium (Local)",
       "provider": "piper",
       "provider_voice": "models/piper-en/en_US-arctic-medium.onnx",
+      "language": "vi",
+      "gender": "",
+      "tier": "free",
+      "preview_video_url": "",
+      "preview_video_path": "",
+      "preview_audio_url": "",
+      "preview_audio_path": "",
+      "enabled": true,
+      "tags": [
+        "local",
+        "piper"
+      ]
+    },
+    {
+      "id": "cogai_test",
+      "name": "Cogai Test (Local)",
+      "provider": "piper",
+      "provider_voice": "models/piper/cogai_test.onnx",
+      "language": "vi",
+      "gender": "",
+      "tier": "free",
+      "preview_video_url": "",
+      "preview_video_path": "",
+      "preview_audio_url": "",
+      "preview_audio_path": "",
+      "enabled": true,
+      "tags": [
+        "local",
+        "piper"
+      ]
+    },
+    {
+      "id": "cogai_new",
+      "name": "Cogai New (Local)",
+      "provider": "piper",
+      "provider_voice": "models/piper/cogai_new.onnx",
+      "language": "vi",
+      "gender": "",
+      "tier": "free",
+      "preview_video_url": "",
+      "preview_video_path": "",
+      "preview_audio_url": "",
+      "preview_audio_path": "",
+      "enabled": true,
+      "tags": [
+        "local",
+        "piper"
+      ]
+    },
+    {
+      "id": "giongbe",
+      "name": "Giongbe (Local)",
+      "provider": "piper",
+      "provider_voice": "models/piper/giongbe.onnx",
       "language": "vi",
       "gender": "",
       "tier": "free",

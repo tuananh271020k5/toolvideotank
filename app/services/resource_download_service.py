@@ -297,13 +297,10 @@ class ResourceDownloadService:
         # models listed by the shared piper-new manifest. Add those entries
         # in memory so resource checks and voice validation see the same set
         # as the UI voice selector.
-        manifest_path = models_path("piper", "voices.json")
-        if os.path.isfile(manifest_path):
-            try:
-                with open(manifest_path, "r", encoding="utf-8-sig") as handle:
-                    manifest = json.load(handle)
-            except Exception:
-                manifest = []
+        from runtime_paths import load_piper_voice_manifest
+
+        manifest = load_piper_voice_manifest("piper")
+        if manifest:
             if isinstance(manifest, list):
                 for metadata in manifest:
                     if not isinstance(metadata, dict):
@@ -925,7 +922,7 @@ class ResourceDownloadService:
                 if block_num % 10 == 0:  # Log every 10 blocks
                     print(f"[Download] Progress: block {block_num}, size {block_size}, total {total_size}")
 
-            print(f"[Download] Calling urlretrieve...")
+            print("[Download] Calling urlretrieve...")
             urllib.request.urlretrieve(zip_url, tmp_path, reporthook=_report_progress)
             print(f"[Download] Download complete. File size: {os.path.getsize(tmp_path)} bytes")
 
@@ -935,7 +932,7 @@ class ResourceDownloadService:
             print(f"[Download] Extracting zip to {extract_to}...")
             with zipfile.ZipFile(tmp_path, "r") as zip_ref:
                 zip_ref.extractall(extract_to)
-            print(f"[Download] Extraction complete.")
+            print("[Download] Extraction complete.")
 
             if progress_cb:
                 progress_cb(100, "Extraction complete.")

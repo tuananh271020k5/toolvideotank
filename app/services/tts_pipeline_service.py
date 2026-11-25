@@ -11,14 +11,14 @@ Produces structured TTSPipelineResult per segment.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Any, Literal
 
 from app.models.subtitle_segment import SubtitleSegment
 from app.services.voice_mapping_service import VoiceMappingService
 from app.services.voiceover_service import VoiceoverService
 from app.services.duration_fitting_service import DurationFittingService, FittedAudioResult
-from app.services.tts_backend import TTSBackend, TTSResult
+from app.services.tts_backend import TTSResult
 
 
 @dataclass

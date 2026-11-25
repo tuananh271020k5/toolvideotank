@@ -6,16 +6,14 @@ except ImportError:
     from ui.main_window_parts.common_deps import *
 
 
-from typing import Any, Dict, List, Optional
 import os
 import json
 import logging
 
-from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QPushButton, QSlider, QProgressBar, QLabel, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox, QTabWidget, QSplitter, QScrollArea, QFrame, QDialog,
-    QApplication, QFileDialog, QMessageBox, QWidget, QMenu
+    QPushButton, QApplication, QMessageBox
 )
 
 logger = logging.getLogger(__name__)
@@ -755,10 +753,9 @@ class MediaPlaybackMixin:
             # The source/video duration is refreshed later by set_video_source;
             # retain the saved duration until then so optional layer geometry
             # can be drawn immediately during project restoration.
-            timeline._duration = max(
-                float(getattr(timeline, "_duration", 0.0) or 0.0),
-                float(getattr(loaded, "duration", 0.0) or 0.0),
-            )
+            saved_dur = float(getattr(loaded, "duration", 0.0) or 0.0)
+            if saved_dur > 0:
+                timeline._duration = saved_dur
             timeline._track_heights = {
                 str(track.id): int(getattr(track, "height", timeline.TRACK_DEFAULT_H))
                 for track in loaded.tracks
@@ -1057,13 +1054,15 @@ class MediaPlaybackMixin:
             self._show_default_inspector()
             # Deselecting a layer only removes edit chrome. Effects and
             # rendered layer content remain visible in the preview.
-            self._timed_layer_preview_signature = None
-            self.refresh_timed_layer_preview()
+            if not is_review_mode:
+                self._timed_layer_preview_signature = None
+                self.refresh_timed_layer_preview()
             return
         # A selection must respect timing immediately, including before the
         # next playback positionChanged signal is emitted.
-        self._timed_layer_preview_signature = None
-        self.refresh_timed_layer_preview()
+        if not is_review_mode:
+            self._timed_layer_preview_signature = None
+            self.refresh_timed_layer_preview()
         layer_type = str(getattr(layer.type, "value", layer.type)).lower()
         can_modify_layer = not bool(getattr(track, "locked", False)) and not bool(getattr(layer, "locked", False))
         if hasattr(self, "timeline_split_btn"):

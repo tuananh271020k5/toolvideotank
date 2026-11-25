@@ -10,7 +10,6 @@ Strictly adheres to Contract Step 9.1 v1.1 (LOCKED):
 from __future__ import annotations
 
 import threading
-from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 

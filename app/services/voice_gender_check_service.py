@@ -10,7 +10,6 @@ from typing import Any, Callable
 from services.engine_runtime import EngineRuntime
 from services.gender_service import GenderService
 from services.subtitle_merge_service import SubtitleMergeService
-from services.subtitle_translation_service import SubtitleTranslationService
 
 
 class VoiceGenderCheckService:
@@ -21,11 +20,31 @@ class VoiceGenderCheckService:
         video_path: str,
         *,
         existing_cues: list[dict[str, Any]] | None = None,
-        progress: Callable[[str], None] | None = None,
+        progress: Callable[..., None] | None = None,
         ocr_rect: tuple[float, float, float, float] | list[float] | None = None,
+        is_cancelled_func: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if not video_path or not os.path.isfile(video_path):
             raise RuntimeError("Không tìm thấy video gốc để kiểm tra.")
+
+        def _notify(pct: float, message: str):
+            if progress:
+                try:
+                    progress(pct, message)
+                except TypeError:
+                    try:
+                        progress(message)
+                    except Exception:
+                        pass
+
+        notify = lambda msg: _notify(55.0, str(msg))
+
+        def _check_cancel():
+            if is_cancelled_func and is_cancelled_func():
+                raise InterruptedError("Tiến trình phân vai AI đã được dừng bởi người dùng.")
+
+        _check_cancel()
+
         if ocr_rect and len(ocr_rect) == 4:
             try:
                 rx, ry, rw, rh = [float(x) for x in ocr_rect]
@@ -33,14 +52,16 @@ class VoiceGenderCheckService:
                     os.environ["OCR_SUBTITLE_RECT"] = f"{rx:.4f},{ry:.4f},{rw:.4f},{rh:.4f}"
             except Exception:
                 pass
-        notify = progress or (lambda _message: None)
+
         engine = EngineRuntime()
 
         with tempfile.TemporaryDirectory(prefix="capcap_voice_gender_") as temp_dir:
             audio_path = os.path.join(temp_dir, "source_audio.wav")
-            notify("Đang tách âm thanh gốc…")
+            _notify(5.0, "Đang trích xuất luồng âm thanh gốc từ video…")
+            _check_cancel()
             if not engine.extract_audio(video_path, audio_path) or not os.path.isfile(audio_path):
                 raise RuntimeError("Không thể tách âm thanh từ video gốc.")
+            _check_cancel()
 
             vad_intervals: list[dict[str, Any]] = []
             asr_segments: list[dict[str, Any]] = []
@@ -77,7 +98,7 @@ class VoiceGenderCheckService:
             # Định nghĩa hàm đọc phụ đề video qua OCR
             def _process_video_ocr():
                 region = str(os.getenv("OCR_SUBTITLE_REGION", "bottom") or "bottom")
-                return list(engine.transcribe_video_ocr(video_path, region=region) or [])
+                return list(engine.transcribe_video_ocr(video_path, region=region, is_cancelled_func=is_cancelled_func) or [])
 
             # Tối ưu hóa: Nếu đã có existing_cues hợp lệ, tái sử dụng ngay và chỉ phân tích audio
             has_valid_existing = bool(
@@ -86,12 +107,12 @@ class VoiceGenderCheckService:
             )
 
             if has_valid_existing:
-                notify("Tái sử dụng phụ đề đã nhận diện, đang phân tích giọng nói (ASR + VAD)…")
+                _notify(15.0, "Tái sử dụng phụ đề đã nhận diện, đang phân tích giọng nói (ASR + VAD)…")
                 raw_cues = [dict(c) for c in (existing_cues or []) if str(c.get("text", "") or "").strip()]
                 vad_intervals, asr_segments = _process_audio_features()
             else:
                 # Chạy SONG SONG tác vụ Audio (VAD + ASR) và Video (OCR) để giảm 50% thời gian chờ
-                notify("Đang xử lý song song: Đọc phụ đề video (OCR) và nhận diện giọng nói (ASR/VAD)…")
+                _notify(15.0, "Đang xử lý song song: Đọc phụ đề video (OCR) và nhận diện giọng nói (ASR/VAD)…")
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                     fut_audio = executor.submit(_process_audio_features)
@@ -100,6 +121,7 @@ class VoiceGenderCheckService:
                     vad_intervals, asr_segments = fut_audio.result()
                     raw_cues = fut_ocr.result()
 
+            _check_cancel()
             cues = [dict(cue) for cue in raw_cues if str(cue.get("text", "") or "").strip()]
             cues = self._filter_ocr_noise(cues)
 
@@ -113,12 +135,14 @@ class VoiceGenderCheckService:
                 )
 
             # 2. Multimodal Fusion (OCR + ASR + VAD) loại bỏ chữ rác bao bì/logo
-            notify("Đang kết hợp OCR, ASR và VAD (Multimodal Fusion)…")
+            _notify(38.0, "Đang kết hợp OCR, ASR và VAD (Multimodal Fusion)…")
+            _check_cancel()
             from services.hybrid_audio_ocr_fusion import classify_ocr_segments_multimodal, align_cues_with_asr_and_vad
             cues = classify_ocr_segments_multimodal(cues, vad_speech_intervals=vad_intervals, asr_segments=asr_segments)
 
             # 2.1 Căn chỉnh ranh giới giọng nói bằng SenseVoice ASR & Silero VAD (Cắt audio chuẩn xác)
-            notify("Đang căn chỉnh thời gian âm thanh phụ đề bằng SenseVoice ASR & VAD…")
+            _notify(45.0, "Đang căn chỉnh thời gian âm thanh phụ đề bằng SenseVoice ASR & VAD…")
+            _check_cancel()
             cues = align_cues_with_asr_and_vad(cues, asr_segments=asr_segments, vad_intervals=vad_intervals)
 
             # Assign consecutive IDs for tracking
@@ -128,7 +152,8 @@ class VoiceGenderCheckService:
             ]
 
             # 3. Audio-First: Nhận diện giọng nói vật lý bằng Gender AI offline trước
-            notify("Đang nhận diện âm học giọng nói (Gender AI Audio-First)…")
+            _notify(52.0, "Đang nhận diện âm học giọng nói (Gender AI Audio-First)…")
+            _check_cancel()
             speech_cues = [c for c in indexed_cues if c.get("status") != "static_text" and not c.get("is_noise")]
             static_cues = [c for c in indexed_cues if c.get("status") == "static_text" or c.get("is_noise")]
             for sc in static_cues:
@@ -279,7 +304,8 @@ class VoiceGenderCheckService:
                 c["id"] = new_idx
 
             # 4.6 3D-Speaker Voiceprint Clustering (Alibaba ERes2Net Embeddings)
-            notify("Đang phân tích vector giọng nói & gom cụm nhân vật (3D-Speaker Clustering)…")
+            _notify(60.0, "Đang phân tích vector giọng nói & gom cụm nhân vật (3D-Speaker Clustering)…")
+            _check_cancel()
             try:
                 from services.speaker_embedding_clusterer import SpeakerEmbeddingClusterer
                 detected = SpeakerEmbeddingClusterer().cluster_cues(audio_path, detected, similarity_threshold=0.35)
@@ -304,7 +330,8 @@ class VoiceGenderCheckService:
             from services.deepseek_service import DeepSeekService
             llm_svc = DeepSeekService()
             llm_name = llm_svc.display_name
-            notify(f"Đang dịch kịch bản & phân tích vai nhân vật ({llm_name})…")
+            _check_cancel()
+            _notify(68.0, f"Đang dịch kịch bản & phân tích vai nhân vật ({llm_name})…")
 
             translated_cues = []
             llm_genders: dict[int, str] = {}
@@ -313,10 +340,19 @@ class VoiceGenderCheckService:
             if llm_svc.is_configured():
                 try:
                     sub_trans_svc = SubtitleTranslationService(llm_svc)
+
+                    def _on_ds_progress(msg, cur, tot):
+                        _check_cancel()
+                        if tot > 0:
+                            pct = 68.0 + (cur / tot) * 20.0
+                            _notify(pct, f"{llm_name} đang dịch & phân vai ({cur}/{tot})…")
+                        else:
+                            _notify(75.0, f"{llm_name} đang dịch & phân vai…")
+
                     translated_cues, _ = sub_trans_svc.translate_with_deepseek(
                         detected,
                         overwrite_manual=True,
-                        progress=lambda msg, cur, tot: notify(f"{llm_name} đang dịch & phân vai ngữ cảnh ({cur}/{tot})…"),
+                        progress=_on_ds_progress,
                     )
                     for tc in translated_cues:
                         cid = tc.get("id")
@@ -330,10 +366,15 @@ class VoiceGenderCheckService:
                 print(f"[Voice Gender Check] Chưa cấu hình API Key cho {llm_name}, chuyển sang bộ dịch dự phòng.")
 
             if not translated_cues:
+                _check_cancel()
+                def _on_sub_prog(msg):
+                    _check_cancel()
+                    _notify(80.0, f"Đang dịch kịch bản dự phòng: {msg}")
+
                 translated_cues = SubtitleTranslationService().translate_cues(
                     detected,
                     target_lang="vi",
-                    progress=notify,
+                    progress=_on_sub_prog,
                 )
 
             # Ghép lại bản dịch vào detected
@@ -351,6 +392,8 @@ class VoiceGenderCheckService:
                 })
 
             # 6. Anchor-Based Temporal Smoothing kết hợp LLM Continuity (Gemini/ChatGPT/DeepSeek)
+            _check_cancel()
+            _notify(90.0, "Đang tối ưu hóa chuỗi hội thoại ngữ cảnh (Temporal Smoothing)…")
             from services.temporal_gender_smoothing import TemporalGenderSmoothingService
             continuity_groups = []
             if llm_genders:
@@ -375,6 +418,8 @@ class VoiceGenderCheckService:
             )
 
             # 7. Decision Fusion Logic (Nơi DUY NHẤT quyết định final_gender)
+            _check_cancel()
+            _notify(95.0, "Đang tổng hợp kịch bản và nhãn vai nhân vật...")
             from services.decision_fusion_service import DecisionFusionService
             final_fused_cues = DecisionFusionService.fuse(
                 smoothed_detected,
@@ -440,6 +485,8 @@ class VoiceGenderCheckService:
                     "merged_from": merged_from,
                     "skip_tts": bool(cue.get("skip_tts", False)),
                 })
+
+            _notify(100.0, f"Hoàn tất phân vai AI thành công ({len(rows)} câu thoại)!")
 
         return {
             "video_path": os.path.abspath(video_path),

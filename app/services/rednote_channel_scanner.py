@@ -12,10 +12,7 @@ Tính năng:
 
 import os
 import sys
-import time
 import re
-import json
-import urllib.request
 from typing import Callable, Optional, Dict, List, Any, Tuple
 
 if sys.platform == "win32":
@@ -131,7 +128,7 @@ def scan_rednote(
             launch_args.append(f"--profile-directory={profile_id}")
 
         launch_kwargs = {
-            "headless": False,
+            "headless": True,
             "args": launch_args,
         }
 

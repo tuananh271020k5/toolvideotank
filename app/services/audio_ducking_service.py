@@ -24,9 +24,13 @@ def _resolve_ffmpeg() -> str:
     if w:
         return w
 
-    local_fallback = os.path.join(r"d:\capcap\CapCap", "bin", "ffmpeg", "ffmpeg.exe")
-    if os.path.isfile(local_fallback):
-        return local_fallback
+    try:
+        from app.runtime_paths import join_root
+        local_fallback = join_root("bin", "ffmpeg", "ffmpeg.exe")
+        if os.path.isfile(local_fallback):
+            return local_fallback
+    except Exception:
+        pass
 
     return "ffmpeg"
 
@@ -187,7 +191,7 @@ class AudioDuckingService:
                 self.ffmpeg_bin,
                 "-y",
                 "-f", "lavfi",
-                "-i", f"anullsrc=r=44100:cl=stereo",
+                "-i", "anullsrc=r=44100:cl=stereo",
                 "-t", str(dur),
                 output_wav_path,
             ]

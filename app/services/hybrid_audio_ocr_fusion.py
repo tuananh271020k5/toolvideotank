@@ -360,7 +360,10 @@ def extract_audio_speech_and_asr(
     # 1. Thử dùng Silero VAD từ app.vad_processor trước
     try:
         import soundfile as sf
-        from app.vad_processor import get_speech_segments
+        try:
+            from vad_processor import get_speech_segments
+        except ImportError:
+            from app.vad_processor import get_speech_segments
         audio, sr = sf.read(audio_path, dtype="float32")
         if audio.ndim > 1:
             audio = audio.mean(axis=1)

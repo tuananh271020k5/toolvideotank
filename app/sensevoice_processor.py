@@ -66,7 +66,6 @@ def load_model(model_dir: str, language: str = "auto"):
 
 
 def transcribe_audio(audio_path: str, model_dir: str, *, language: str = "auto") -> list[dict]:
-    import sherpa_onnx
 
     load_model(model_dir, language=language)
     sr, audio = wavfile.read(audio_path)

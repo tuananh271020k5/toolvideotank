@@ -55,3 +55,6 @@ render_jobs/
 *.mp3
 .codegraph/
 assets/voices/
+*.m4a
+*.part
+

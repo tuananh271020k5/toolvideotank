@@ -904,13 +904,17 @@ class PreviewController:
         except Exception:
             return 0.0
 
-    def export_final_video(self):
+    def export_final_video(self, force_subtitle_mode: bool = False):
         video_path = self.gui.video_path_edit.text().strip()
         if not video_path or not os.path.exists(video_path):
             QMessageBox.warning(self.gui, "Error", "Please choose a video first.")
             return
 
-        mode = self._effective_render_mode_without_tts(self.gui.get_output_mode_key())
+        if force_subtitle_mode:
+            mode = "subtitle"
+            self.gui.log("[Export] Xuất video ở chế độ CHỈ PHỤ ĐỀ (giữ nguyên âm thanh gốc, không lồng tiếng).")
+        else:
+            mode = self._effective_render_mode_without_tts(self.gui.get_output_mode_key())
         original_audio_gain_db = self._original_audio_gain_db_for_render(mode)
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         translated_srt_path = self.gui.last_translated_srt_path
@@ -1500,7 +1504,7 @@ class PreviewController:
         self.gui.preview_thread.finished.connect(
             lambda preview_path, error: self.gui.on_preview_ready(preview_path, error, styled_signature)
         )
-        self.gui.log(f"[Preview] Starting preview thread")
+        self.gui.log("[Preview] Starting preview thread")
         self.gui.preview_thread.start()
 
     def on_preview_ready(self, preview_path, error, styled_signature=""):

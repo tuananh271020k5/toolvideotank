@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
 
-from utils.media_utils import browse_video
 
 
 class SequentialQueueController(QObject):
@@ -113,6 +112,7 @@ class SequentialQueueController(QObject):
             "burn_subs": True,
             "sub_cfg": None,
             "brand_logo": None,
+            "frame_border": None,
             "watermark": None,
         }
         return self.start_single_voice_queue(selected_items, default_cfg)
@@ -349,6 +349,19 @@ class SequentialQueueController(QObject):
             getattr(self.gui, "_video_ocr_rects", {}).get(norm_p)
             or self._setup_config.get("default_blur_rect")
         )
+        if not ocr_rect:
+            from PySide6.QtCore import QSettings
+            def_ocr = QSettings("TankVideo", "TankVideoStudio").value("default_ocr_rect", "")
+            if def_ocr:
+                try:
+                    p_ocr = [float(x) for x in def_ocr.split(",")]
+                    if len(p_ocr) == 4 and p_ocr[2] > 0 and p_ocr[3] > 0:
+                        ocr_rect = tuple(p_ocr)
+                except Exception:
+                    pass
+        if not ocr_rect:
+            ocr_rect = (0.05, 0.80, 0.90, 0.15)  # Chuẩn phụ đề dưới đáy
+
         if ocr_rect and len(ocr_rect) == 4:
             os.environ["OCR_SUBTITLE_RECT"] = f"{ocr_rect[0]},{ocr_rect[1]},{ocr_rect[2]},{ocr_rect[3]}"
 
@@ -420,8 +433,55 @@ class SequentialQueueController(QObject):
         mask_mode = str(self._setup_config.get("mask_mode") or getattr(sub_cfg, "mask_mode", "box") or "box").strip().lower()
         burn_subs = bool(self._setup_config.get("burn_subs", True))
         brand_logo = self._setup_config.get("brand_logo")
+        frame_border = self._setup_config.get("frame_border")
         watermark = self._setup_config.get("watermark")
-        delogo_settings = self._setup_config.get("delogo_settings")
+        delogo_settings = dict(self._setup_config.get("delogo_settings") or {})
+
+        # Tự động gắn khung Xóa Logo riêng của video (hoặc khung đã lưu/đã vẽ trên màn hình)
+        delogo_rect = getattr(self.gui, "_video_delogo_rects", {}).get(norm_p)
+        if not delogo_rect:
+            delogo_ov = getattr(self.gui, "delogo_region_overlay", None)
+            if delogo_ov and (getattr(delogo_ov, "_user_customized", False) or getattr(self.gui, "_delogo_overlay_visible", False)):
+                delogo_rect = delogo_ov.get_norm_rect()
+            else:
+                from PySide6.QtCore import QSettings
+                def_dl = QSettings("TankVideo", "TankVideoStudio").value("delogo/default_rect", "")
+                if def_dl:
+                    try:
+                        p_dl = [float(x) for x in def_dl.split(",")]
+                        if len(p_dl) == 4 and p_dl[2] > 0 and p_dl[3] > 0:
+                            delogo_rect = tuple(p_dl)
+                    except Exception:
+                        pass
+        if delogo_rect:
+            delogo_settings["delogo_custom"] = True
+            delogo_settings["delogo_custom_rect"] = delogo_rect
+            delogo_settings["delogo_custom_mode"] = delogo_settings.get("delogo_custom_mode", "inpaint_ns")
+            self.gui.log(f"[Hàng đợi {self.current_index + 1}/{len(self.queue)}] Áp dụng khung Xóa Logo AI ({delogo_rect[0]:.2f}, {delogo_rect[1]:.2f}, {delogo_rect[2]:.2f}, {delogo_rect[3]:.2f})")
+
+        # CHỈ áp dụng Xóa Watermark nếu người dùng thực sự bật nút Xóa Watermark trên Preview hoặc đã cấu hình rõ ràng
+        wm_btn = getattr(self.gui, "watermark_region_btn", None)
+        wm_ov = getattr(self.gui, "watermark_region_overlay", None)
+        wm_is_requested = bool(
+            (wm_btn and wm_btn.isChecked())
+            or (wm_ov and getattr(wm_ov, "_user_customized", False) and getattr(self.gui, "_watermark_overlay_visible", False))
+            or self._setup_config.get("delogo_watermark", False)
+        )
+        if wm_is_requested:
+            wm_rect = getattr(self.gui, "_video_watermark_rects", {}).get(norm_p)
+            if not wm_rect and wm_ov and getattr(wm_ov, "_user_customized", False):
+                wm_rect = wm_ov.get_norm_rect()
+            if wm_rect and len(wm_rect) == 4 and wm_rect[2] > 0.01 and wm_rect[3] > 0.01:
+                delogo_settings["delogo_watermark"] = True
+                delogo_settings["delogo_watermark_rect"] = wm_rect
+                delogo_settings["delogo_watermark_mode"] = delogo_settings.get("delogo_watermark_mode", "delogo")
+                self.gui.log(f"[Hàng đợi {self.current_index + 1}/{len(self.queue)}] Áp dụng khung Xóa Watermark ({wm_rect[0]:.2f}, {wm_rect[1]:.2f}, {wm_rect[2]:.2f}, {wm_rect[3]:.2f})")
+            else:
+                delogo_settings["delogo_watermark"] = False
+                delogo_settings["delogo_watermark_rect"] = None
+        else:
+            delogo_settings["delogo_watermark"] = False
+            delogo_settings["delogo_watermark_rect"] = None
 
         approved_cues = v_cfg.get("approved_cues") if is_dual else None
 
@@ -438,6 +498,7 @@ class SequentialQueueController(QObject):
             output_video_path=output_video_path,
             subtitle_config=sub_cfg,
             brand_logo_settings=brand_logo,
+            frame_border_settings=frame_border,
             watermark_settings=watermark,
             delogo_settings=delogo_settings,
             dual_voice_config=dual_cfg,
@@ -470,13 +531,6 @@ class SequentialQueueController(QObject):
                 self.gui._video_translated_cues = {}
             if translated_cues:
                 self.gui._video_translated_cues[norm_p] = translated_cues
-                try:
-                    from app.translation.srt_utils import to_srt
-                    srt_out_path = os.path.splitext(output_video_path)[0] + ".srt"
-                    with open(srt_out_path, "w", encoding="utf-8") as sf:
-                        sf.write(to_srt(translated_cues, prefer_translated=True))
-                except Exception as srt_err:
-                    self.gui.log(f"[Hàng đợi] Không thể ghi file phụ đề SRT: {srt_err}")
 
             # Nếu video vừa hoàn tất đang hiển thị trên player, đồng bộ ngay phụ đề lên timeline và cột phụ đề
             cur_p = getattr(self.gui, "_current_video_path", "")

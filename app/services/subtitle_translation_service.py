@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Callable
 
 from models.subtitle_segment import SubtitleSegment
-from services.deepseek_service import DeepSeekService, DeepSeekTranslationError
+from services.deepseek_service import DeepSeekService
 
 
 class SubtitleTranslationService:

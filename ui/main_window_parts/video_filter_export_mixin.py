@@ -12,8 +12,6 @@ except ImportError:
 
 
 import os
-import subprocess
-from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QFileDialog, QMessageBox
@@ -568,8 +566,11 @@ class VideoFilterExportMixin:
             self.save_user_settings()
         except Exception as exc:
             self.log(f"[Filter] Could not persist filter settings: {exc}")
-    def export_final_video(self):
-        self.preview_controller.export_final_video()
+    def export_final_video(self, force_subtitle_mode: bool = False):
+        self.preview_controller.export_final_video(force_subtitle_mode=force_subtitle_mode)
+
+    def export_subtitle_only_video(self):
+        self.preview_controller.export_final_video(force_subtitle_mode=True)
     def on_export_progress(self, percent: int, message: str):
         dlg = self._ensure_export_progress_dialog()
         if dlg is None:
@@ -634,6 +635,8 @@ class VideoFilterExportMixin:
         finally:
             self.export_progress_dialog = None
     def export_runtime_logs(self):
+        import time
+
         default_name = f"capcap_logs_{time.strftime('%Y%m%d_%H%M%S')}.txt"
         default_path = os.path.join(self.workspace_root, default_name)
         file_path, _ = QFileDialog.getSaveFileName(

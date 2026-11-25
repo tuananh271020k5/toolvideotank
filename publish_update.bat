@@ -1,9 +1,10 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
 echo =======================================================
-echo    PHÁT HÀNH BẢN CẬP NHẬT TỰ ĐỘNG - TANKVIDEO STUDIO
+echo    PHAT HANH BAN CAP NHAT TU DONG - TANKVIDEO STUDIO
 echo =======================================================
 echo.
-python tools\publish_update.py
+"%~dp0.venv\Scripts\python.exe" tools\publish_update.py
 echo.
 pause

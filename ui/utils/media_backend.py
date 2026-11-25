@@ -779,6 +779,7 @@ class MpvMediaPlayerBackend(QObject):
         self._source_path = source_path
         self._position_ms = 0
         self._duration_ms = 0
+        self._last_applied_vf_str = None
         self._state = QMediaPlayer.PausedState
         self._player.pause = True
         self._player.command("loadfile", source_path, "replace")
@@ -1049,6 +1050,9 @@ class MpvMediaPlayerBackend(QObject):
             input_label=("b_last" if blur_body else ("color_main" if color_body else None))
         )
         if not color_body and not blur_body and not mask_body:
+            if getattr(self, "_last_applied_vf_str", None) == "":
+                return
+            self._last_applied_vf_str = ""
             try:
                 self._player.command("vf", "remove", f"@{self._managed_vf_label}")
             except Exception:
@@ -1070,8 +1074,13 @@ class MpvMediaPlayerBackend(QObject):
             combined = mask_body
         if color_body:
             combined = f"{color_body};{combined}" if combined else color_body
+
+        target_vf_cmd = f"@{self._managed_vf_label}:lavfi=[{combined}]"
+        if target_vf_cmd == getattr(self, "_last_applied_vf_str", None):
+            return
+        self._last_applied_vf_str = target_vf_cmd
         try:
-            self._player.command("vf", "set", f"@{self._managed_vf_label}:lavfi=[{combined}]")
+            self._player.command("vf", "set", target_vf_cmd)
         except Exception:
             try:
                 self._player.vf = f"lavfi=[{combined}]"

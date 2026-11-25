@@ -5,9 +5,8 @@ from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPai
 from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView, QPushButton
 
 
-from app.layers.base import BaseLayer, LayerType
-from app.layers.timeline import Timeline, Track, Clip
-from app.layers.dub_subtitle import DubSubtitleLayer
+from app.layers.base import LayerType
+from app.layers.timeline import Timeline, Track
 from app.runtime_paths import subprocess_hidden_kwargs
 
 
@@ -173,14 +172,16 @@ class EditorTimeline(QGraphicsView):
     def clear(self) -> None:
         """Xóa toàn bộ các lớp trên timeline và reset trạng thái khi chuyển video."""
         self._selected_layer_id = ""
+        self._duration = 0.0
+        if self._timeline:
+            self._timeline.duration = 0.0
+            for track in self._timeline.tracks:
+                track.layers.clear()
         self._segment_indices.clear()
         if hasattr(self, "_overlap_layout_cache"):
             self._overlap_layout_cache.clear()
         if hasattr(self, "_overlap_row_assignments"):
             self._overlap_row_assignments.clear()
-        if self._timeline:
-            for track in self._timeline.tracks:
-                track.layers.clear()
         self._waveform_samples = []
         self._video_thumbnails = []
         self._redraw()
@@ -230,7 +231,10 @@ class EditorTimeline(QGraphicsView):
 
         end_times = [float(d.get("end", 0)) for d in seg_dicts]
         if end_times:
-            self._duration = max(self._duration, max(end_times))
+            if self._duration <= 0:
+                self._duration = max(end_times)
+            else:
+                self._duration = max(self._duration, max(end_times))
 
         self._ensure_tracks_populated()
         self._redraw()
@@ -268,11 +272,12 @@ class EditorTimeline(QGraphicsView):
             elif t.name == "A1 Audio":
                 a1 = t
 
-        max_dur = self._duration
-        for t in self._timeline.tracks:
-            for l in t.layers:
-                max_dur = max(max_dur, l.end)
-        self._duration = max_dur
+        target_dur = float(self._duration or 0.0)
+        if target_dur <= 0:
+            for t in self._timeline.tracks:
+                for l in t.layers:
+                    target_dur = max(target_dur, float(getattr(l, "end", 0.0) or 0.0))
+            self._duration = target_dur
 
         from app.layers.timeline import Track
         from app.layers.base import LayerType
@@ -291,25 +296,25 @@ class EditorTimeline(QGraphicsView):
         if v1 and not v1.layers:
             v1.layers.append(VideoLayer(
                 name="V1 Video", source="",
-                start=0.0, end=max_dur,
+                start=0.0, end=target_dur,
                 transform=Transform(x=0, y=0, scale_x=1.0, scale_y=1.0),
             ))
         elif v1 and v1.layers:
             for l in v1.layers:
-                if max_dur > l.end:
-                    l.end = max_dur
+                if (float(getattr(l, "end", 0.0) or 0.0) <= 0 or float(getattr(l, "end", 0.0) or 0.0) > target_dur * 1.5) and target_dur > 0:
+                    l.end = target_dur
 
         if a1 and not a1.layers:
             a1.layers.append(AudioLayer(
                 name="A1 Audio",
                 source="",
-                start=0.0, end=max_dur,
+                start=0.0, end=target_dur,
                 volume=1.0,
             ))
         elif a1 and a1.layers:
             for l in a1.layers:
-                if max_dur > l.end:
-                    l.end = max_dur
+                if (float(getattr(l, "end", 0.0) or 0.0) <= 0 or float(getattr(l, "end", 0.0) or 0.0) > target_dur * 1.5) and target_dur > 0:
+                    l.end = target_dur
 
     def set_duration_ms(self, ms: int) -> None:
         new_dur = max(0, ms / 1000.0)
@@ -418,10 +423,15 @@ class EditorTimeline(QGraphicsView):
             duration_s = self._probe_video_duration(path)
         if duration_s > 0:
             ensure_v1_a1_tracks(self._timeline, path, duration_s)
-            self._duration = max(self._duration, duration_s)
+            self._duration = float(duration_s)
             # Keep the Timeline model's duration in sync so layers that
             # span the whole video (Mask track) use the real length.
             self._timeline.duration = self._duration
+            for t in self._timeline.tracks:
+                if t.name in ("V1 Video", "A1 Audio"):
+                    for l in t.layers:
+                        l.start = 0.0
+                        l.end = float(duration_s)
             QTimer.singleShot(50, self.fit_timeline)
         self._redraw()
 
@@ -819,7 +829,7 @@ class EditorTimeline(QGraphicsView):
         is_subtitle = self._is_subtitle_track(track)
         if is_subtitle:
             sync_mode = (self._voice_sync_mode or "").strip().lower()
-            if sync_mode == "timeline priority":
+            if sync_mode in ("timeline priority", "ưu tiên timeline", "timeline"):
                 return False
         return is_subtitle or self._is_dub_track(track)
 

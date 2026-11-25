@@ -4,7 +4,7 @@ import os
 import re
 import math
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBitmap, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -405,19 +405,30 @@ class _SubtitleOverlayWidget(QWidget):
                 line_rects.append(QRectF(rect.x(), y, rect.width(), line_height))
                 y += line_height
 
-        if self.background_box:
+        # Luôn vẽ hộp nền mặt nạ che chữ gốc nếu background_box bật HOẶC khi đang xem phụ đề đã dịch
+        main_win = getattr(self._target_view, "_main_window", None) if self._target_view else None
+        show_mask = self.background_box
+        if not show_mask and main_win:
+            # Nếu video có phụ đề tiếng Việt đã dịch, tự động bật mặt nạ che chữ Trung gốc
+            has_translated = bool(getattr(main_win, "current_translated_segments", None))
+            if has_translated:
+                show_mask = True
+
+        if show_mask:
             painter.setPen(Qt.NoPen)
-            box_color = QColor(self.background_color)
+            # Màu nền đen mờ sang trọng che kín hoàn toàn chữ Trung gốc bên dưới (giống kịch bản ASS lúc xuất video)
+            b_alpha = getattr(self.background_color, "alpha", lambda: 235)()
+            if b_alpha < 180:
+                b_alpha = 235
+            box_color = QColor(0, 0, 0, b_alpha)
             if self.animation_style == "background appear":
                 box_color.setAlpha(int(round(box_color.alpha() * progress)))
             painter.setBrush(box_color)
             metrics = painter.fontMetrics()
-            # libass uses the BorderStyle=3 outline size as the box padding.
-            # The old fixed 18px padding made the live box much wider than
-            # the exported result.
-            box_pad_x = max(2, int(round(max(2.0, self.outline_width))))
-            box_pad_y = max(1, int(round(max(1.0, self.outline_width * 0.5))))
-            max_width = max((metrics.boundingRect(line).width() for line in visible_lines), default=0)
+            # Khoảng đệm rộng rãi che kín hoàn toàn dòng chữ tiếng Trung gốc bên dưới (khớp với ASS BgBadge lúc xuất)
+            box_pad_x = max(16, int(round(self.font_size * 0.55)))
+            box_pad_y = max(6, int(round(self.font_size * 0.26)))
+            max_width = max((metrics.horizontalAdvance(line) for line in visible_lines), default=0)
             if max_width and line_rects:
                 block_top = line_rects[0].top()
                 block_bottom = line_rects[-1].bottom()
@@ -427,7 +438,8 @@ class _SubtitleOverlayWidget(QWidget):
                     max_width,
                     max(1, int(round(block_bottom - block_top))),
                 ).adjusted(-box_pad_x, -box_pad_y, box_pad_x, box_pad_y)
-                painter.drawRect(QRectF(text_rect))
+                radius = min(10, int(round(text_rect.height() * 0.22)))
+                painter.drawRoundedRect(QRectF(text_rect), radius, radius)
 
         if self.shadow_depth > 0 and not has_colored_effects:
             painter.setPen(self.shadow_color)
@@ -1796,9 +1808,32 @@ class MpvVideoView(QWidget):
         left_pad = rect.left() + side_margin_px
         right_limit = rect.right() - item_w - side_margin_px
 
-        if item.custom_position_enabled:
+        # Tự động neo vị trí phụ đề vào tâm dòng chữ Trung (khung OCR) của video để đè khít lên chữ gốc
+        ocr_cy = None
+        main_win = getattr(self, "_main_window", None) or (self.window() if hasattr(self, "window") else None)
+        if main_win:
+            cur_p = getattr(main_win, "_current_video_path", "")
+            if cur_p:
+                norm_p = os.path.normpath(cur_p)
+                rect_o = getattr(main_win, "_video_ocr_rects", {}).get(norm_p)
+                if rect_o and len(rect_o) == 4 and rect_o[2] > 0 and rect_o[3] > 0:
+                    ocr_cy = rect_o[1] + rect_o[3] / 2.0
+            if ocr_cy is None and hasattr(main_win, "ocr_region_overlay"):
+                ov = getattr(main_win, "ocr_region_overlay", None)
+                if ov and hasattr(ov, "get_norm_rect"):
+                    r_ov = ov.get_norm_rect()
+                    if r_ov and len(r_ov) == 4 and r_ov[2] > 0 and r_ov[3] > 0:
+                        ocr_cy = r_ov[1] + r_ov[3] / 2.0
+
+        eff_custom_pos = item.custom_position_enabled
+        eff_y_pct = item.custom_y_percent
+        if not eff_custom_pos and ocr_cy is not None:
+            eff_custom_pos = True
+            eff_y_pct = int(round(ocr_cy * 100))
+
+        if eff_custom_pos:
             x_pos = rect.left() + (rect.width() * item.custom_x_percent / 100.0) - (item_w / 2.0)
-            y_pos = rect.top() + (rect.height() * item.custom_y_percent / 100.0) - (item_h / 2.0)
+            y_pos = rect.top() + (rect.height() * eff_y_pct / 100.0) - (item_h / 2.0)
         else:
             if item.alignment == "Bottom Left":
                 x_pos = left_pad

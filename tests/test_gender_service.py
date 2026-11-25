@@ -11,32 +11,6 @@ def test_music_is_normalized_to_none():
     assert result["skip_tts"] is True
 
 
-def test_window_consensus_requires_two_non_conflicting_votes(tmp_path):
-    package = tmp_path / "gender"
-    package.mkdir()
-    (package / "gender_classifier.joblib").write_bytes(b"model")
-    (package / "runtime_models").mkdir()
-    service = GenderService(package)
-    predictions = [
-        {"id": "1:exact", "gender": "unknown", "confidence": 0.7, "status": "uncertain_gender"},
-        {"id": "1:w1.00", "gender": "female", "confidence": 0.99, "status": "ok"},
-        {"id": "1:w1.25", "gender": "female", "confidence": 0.98, "status": "ok"},
-    ]
-    result = service._resolve("1", predictions)
-    assert result["gender"] == "female"
-    assert result["status"] == "window_consensus"
-    assert result["skip_tts"] is False
-
-
-def test_conflicting_windows_stay_unknown(tmp_path):
-    package = tmp_path / "gender"
-    package.mkdir()
-    (package / "gender_classifier.joblib").write_bytes(b"model")
-    (package / "runtime_models").mkdir()
-    service = GenderService(package)
-    result = service._resolve("1", [
-        {"id": "1:w1.00", "gender": "female", "confidence": 0.99, "status": "ok"},
-        {"id": "1:w1.25", "gender": "male", "confidence": 0.99, "status": "ok"},
-    ])
-    assert result["gender"] == "unknown"
-    assert result["skip_tts"] is False
+# The former ``GenderService._resolve`` window-consensus tests were removed:
+# that logic no longer exists in GenderService (detection now runs in the
+# external gender worker), so the tests could only ever fail.

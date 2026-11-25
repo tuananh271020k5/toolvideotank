@@ -10,9 +10,8 @@ except ImportError:
 
 
 import os
-from typing import Any
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QMessageBox
 
 
@@ -327,10 +326,12 @@ class TtsVoiceoverMixin:
                         self.log(f"[Voice] Piper voice preloaded: {expected_voice}")
                 QTimer.singleShot(0, _mark_ready)
             except Exception as exc:
+                err_text = str(exc)
+
                 def _mark_failed():
                     if getattr(self, '_voice_preload_inflight', '') == expected_voice:
                         self._voice_preload_inflight = ''
-                        self.log(f"[Voice] Piper preload skipped: {exc}")
+                        self.log(f"[Voice] Piper preload skipped: {err_text}")
                 QTimer.singleShot(0, _mark_failed)
 
         threading.Thread(target=_worker, args=(current_token,), daemon=True).start()

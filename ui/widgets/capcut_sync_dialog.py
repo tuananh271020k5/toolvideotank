@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime
-import os
 from typing import Any
 
 from PySide6.QtCore import QSettings, Qt, QThread, Signal

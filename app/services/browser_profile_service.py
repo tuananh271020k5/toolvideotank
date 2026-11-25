@@ -5,9 +5,8 @@ và đọc danh sách Profile của từng trình duyệt từ file 'Local State
 """
 
 import os
-import sys
 import json
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 
 
 def get_installed_browsers_with_profiles() -> List[Dict[str, Any]]:

@@ -30,12 +30,11 @@ import socket
 import subprocess
 import sys
 import time
-import traceback
 import urllib.request
 from collections import deque
 from typing import Optional, Callable
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, QTimer
+from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from models.pipeline_context import PipelineContext, VideoWorkspace
 

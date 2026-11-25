@@ -1,10 +1,7 @@
 import html as html_lib
-import json
 import logging
 import os
 import re
-import sys
-import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple

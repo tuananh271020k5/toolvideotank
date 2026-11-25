@@ -80,6 +80,25 @@ class VoiceWorkflow:
     MAX_STUBBORN_SEGMENT_SPEED = 1.10
     TARGET_RATIO_FLOOR = 0.84
     TARGET_RATIO_CEIL = 1.08
+    # Elastic ("Thông minh") timing: per-sentence tempo fit with limits.
+    ELASTIC_MAX_SPEED = 1.35      # fastest allowed speed-up (env CAPCAP_DUB_MAX_SPEED)
+    ELASTIC_MIN_SPEED = 0.90      # slowest allowed slow-down (env CAPCAP_DUB_MIN_SPEED)
+    ELASTIC_SLOW_TRIGGER = 0.80   # slow down only when voice fills < 80% of its window
+    ELASTIC_FILL_TARGET = 0.92    # when slowing, aim to fill ~92% of the window
+    ELASTIC_BORROW_GAP = 0.35     # seconds of following pause a sentence may borrow
+    ELASTIC_MIN_GAP = 0.06        # pause always kept before the next sentence
+    ELASTIC_MAX_JUMP = 0.15       # max tempo difference between adjacent sentences
+    ELASTIC_SCENE_GAP = 1.2       # pauses longer than this reset tempo smoothing
+    _SYNC_MODE_ALIASES = {
+        "": "off", "off": "off", "tắt": "off", "tat": "off",
+        "thông minh": "elastic", "thong minh": "elastic", "elastic": "elastic",
+        "co giãn": "elastic", "co giãn tự nhiên": "elastic", "natural": "elastic",
+        "smart": "smart",
+        "ưu tiên timeline": "timeline", "uu tien timeline": "timeline",
+        "timeline priority": "timeline", "timeline": "timeline",
+        "ép khớp thời gian": "force", "ep khop thoi gian": "force",
+        "force fit": "force", "force": "force",
+    }
 
     def __init__(self, workspace_root: str):
         self.workspace_root = workspace_root
@@ -856,7 +875,7 @@ class VoiceWorkflow:
 
     def _write_silence_wav(self, wav_path: str, duration_seconds: float) -> str:
         duration = max(0.2, float(duration_seconds or 0.0))
-        sample_rate = 16000
+        sample_rate = 24000
         frame_count = max(1, int(round(duration * sample_rate)))
         os.makedirs(os.path.dirname(wav_path) or ".", exist_ok=True)
         with wave.open(wav_path, "wb") as wav_file:
@@ -1220,6 +1239,216 @@ class VoiceWorkflow:
                     seg["_original_end"] = end_s
                 seg["_audio_end"] = audio_end
 
+    # ------------------------------------------------------------------
+    # Elastic timing ("Thông minh")
+    # ------------------------------------------------------------------
+    @classmethod
+    def _normalize_sync_mode(cls, mode) -> str:
+        """Map UI labels (Vietnamese or English) to internal sync keys."""
+        import unicodedata
+        key = unicodedata.normalize("NFC", str(mode or "")).strip().lower()
+        return cls._SYNC_MODE_ALIASES.get(key, key)
+
+    @staticmethod
+    def _env_speed(name: str, default: float, low: float, high: float) -> float:
+        try:
+            value = float(str(os.getenv(name, "") or "").strip() or default)
+        except ValueError:
+            value = default
+        return max(low, min(high, value))
+
+    @staticmethod
+    def _read_pcm16(wav_path: str):
+        import numpy as np
+        with wave.open(wav_path, "rb") as wav_file:
+            params = wav_file.getparams()
+            raw = wav_file.readframes(wav_file.getnframes())
+        if params.sampwidth != 2:
+            return None, params
+        data = np.frombuffer(raw, dtype=np.int16).reshape(-1, max(1, params.nchannels))
+        return data, params
+
+    @staticmethod
+    def _write_pcm16(wav_path: str, data, params) -> None:
+        with wave.open(wav_path, "wb") as wav_file:
+            wav_file.setnchannels(params.nchannels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(params.framerate)
+            wav_file.writeframes(data.astype("int16").tobytes())
+
+    def _trim_wav_edge_silence(self, wav_path: str, output_path: str, *, lead_keep: float = 0.03, tail_keep: float = 0.06) -> str:
+        """Remove leading/trailing TTS silence so tempo is fitted to speech only."""
+        import numpy as np
+        try:
+            data, params = self._read_pcm16(wav_path)
+            if data is None or len(data) == 0:
+                return wav_path
+            mono = np.abs(data.astype(np.float32)).mean(axis=1)
+            win = max(1, int(params.framerate * 0.01))
+            frames = len(mono) // win
+            if frames < 3:
+                return wav_path
+            energy = mono[: frames * win].reshape(frames, win).max(axis=1)
+            threshold = max(float(energy.max()) * 0.02, 120.0)
+            voiced = np.nonzero(energy > threshold)[0]
+            if len(voiced) == 0:
+                return wav_path
+            start = max(0, voiced[0] * win - int(lead_keep * params.framerate))
+            end = min(len(data), (voiced[-1] + 1) * win + int(tail_keep * params.framerate))
+            if start + (len(data) - end) < int(0.02 * params.framerate):
+                return wav_path
+            self._write_pcm16(output_path, data[start:end], params)
+            return output_path
+        except Exception as exc:
+            print(f"[Elastic Timing] Silence trim skipped for {os.path.basename(wav_path)}: {exc}")
+            return wav_path
+
+    def _truncate_wav_with_fade(self, wav_path: str, output_path: str, duration: float, fade: float = 0.08) -> str:
+        """Last-resort guard so a sentence never talks over the next one."""
+        import numpy as np
+        try:
+            data, params = self._read_pcm16(wav_path)
+            if data is None:
+                return wav_path
+            keep = max(1, int(duration * params.framerate))
+            if keep >= len(data):
+                return wav_path
+            out = data[:keep].astype(np.float32)
+            fade_len = min(len(out), max(1, int(fade * params.framerate)))
+            out[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)[:, None]
+            self._write_pcm16(output_path, out, params)
+            return output_path
+        except Exception as exc:
+            print(f"[Elastic Timing] Overflow guard skipped: {exc}")
+            return wav_path
+
+    def _apply_elastic_timing(self, *, segments, wavs, tmp_dir: str, voice_speed: float):
+        """Fit each dubbed sentence to its original speech window.
+
+        * Window = original cue duration + up to ELASTIC_BORROW_GAP of the
+          following pause (always leaving ELASTIC_MIN_GAP).
+        * Too long  -> speed up (pitch preserved, atempo), capped at MAX.
+        * Much too short -> slow down slightly, capped at MIN.
+        * Adjacent sentences may not differ by more than ELASTIC_MAX_JUMP in
+          tempo (slower ones are raised), so the rhythm stays even.
+        * Overflow that would still talk over the next sentence is faded out.
+        """
+        segments = list(segments or [])
+        polished = list(wavs or [])
+        if abs(float(voice_speed) - 1.0) >= 0.02 or any(seg.get("voice_speed") for seg in segments):
+            polished = self._apply_segment_speed(
+                wavs=polished, tmp_dir=tmp_dir, voice_speed=voice_speed, segments=segments,
+            )
+        max_speed = self._env_speed("CAPCAP_DUB_MAX_SPEED", self.ELASTIC_MAX_SPEED, 1.0, 2.0)
+        min_speed = self._env_speed("CAPCAP_DUB_MIN_SPEED", self.ELASTIC_MIN_SPEED, 0.5, 1.0)
+        count = min(len(segments), len(polished))
+        voiced = [
+            idx for idx in range(count)
+            if polished[idx] and os.path.exists(polished[idx])
+            and float(segments[idx].get("end", 0.0)) - float(segments[idx].get("start", 0.0)) > 0.05
+        ]
+        if not voiced:
+            return polished
+
+        for idx in voiced:
+            polished[idx] = self._trim_wav_edge_silence(
+                polished[idx], os.path.join(tmp_dir, f"seg_{idx:04d}_elastic_trim.wav")
+            )
+
+        next_start = {}
+        for pos, idx in enumerate(voiced):
+            next_start[idx] = float(segments[voiced[pos + 1]].get("start", 0.0)) if pos + 1 < len(voiced) else None
+
+        speeds = {}
+        for idx in voiced:
+            seg = segments[idx]
+            start, end = float(seg.get("start", 0.0)), float(seg.get("end", 0.0))
+            duration = end - start
+            nxt = next_start[idx]
+            borrow = self.ELASTIC_BORROW_GAP if nxt is None else min(
+                self.ELASTIC_BORROW_GAP, max(0.0, nxt - end - self.ELASTIC_MIN_GAP)
+            )
+            window = duration + borrow
+            actual = self._probe_wav_duration_seconds(polished[idx])
+            if actual <= 0.0:
+                continue
+            fill = actual / duration
+            if actual > window:
+                speed = actual / window
+            elif fill < self.ELASTIC_SLOW_TRIGGER:
+                speed = max(min_speed, fill / self.ELASTIC_FILL_TARGET)
+            else:
+                speed = 1.0
+            speeds[idx] = min(max_speed, speed)
+
+        # Even rhythm: raise tempo of a sentence that is much slower than a
+        # close neighbour (never lower, so every sentence still fits).
+        ordered = [idx for idx in voiced if idx in speeds]
+        for sequence in (ordered, list(reversed(ordered))):
+            for pos in range(1, len(sequence)):
+                cur, ref = sequence[pos], sequence[pos - 1]
+                first, second = sorted((cur, ref))
+                gap = float(segments[second].get("start", 0.0)) - float(segments[first].get("end", 0.0))
+                if gap > self.ELASTIC_SCENE_GAP:
+                    continue
+                floor = speeds[ref] - self.ELASTIC_MAX_JUMP
+                target = floor if speeds[cur] >= 1.0 else min(floor, 1.0)
+                if speeds[cur] < target:
+                    speeds[cur] = min(max_speed, target)
+
+        stats = {"faster": 0, "slower": 0, "natural": 0, "overflow_faded": 0}
+        speed_jobs = {idx: speeds[idx] for idx in ordered if abs(speeds[idx] - 1.0) >= 0.02}
+
+        def _speed_job(job_idx: int) -> str:
+            job_speed = speed_jobs[job_idx]
+            return self.engine_runtime.change_wav_speed(
+                input_wav_path=polished[job_idx],
+                output_wav_path=os.path.join(tmp_dir, f"seg_{job_idx:04d}_elastic_{int(round(job_speed * 100)):03d}.wav"),
+                speed_ratio=job_speed,
+            )
+
+        if speed_jobs:
+            # Each job is an independent ffmpeg process.
+            workers = max(1, min(6, (os.cpu_count() or 2) // 2, len(speed_jobs)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_speed_job, job_idx): job_idx for job_idx in speed_jobs}
+                for future in as_completed(futures):
+                    job_idx = futures[future]
+                    try:
+                        polished[job_idx] = future.result()
+                    except Exception as exc:
+                        print(f"[Elastic Timing] Speed change failed for segment {job_idx + 1}: {exc}")
+                        speeds[job_idx] = 1.0
+        for idx in ordered:
+            seg = segments[idx]
+            speed = speeds[idx]
+            if idx in speed_jobs and speed != 1.0:
+                stats["faster" if speed > 1.0 else "slower"] += 1
+            else:
+                stats["natural"] += 1
+            nxt = next_start[idx]
+            if nxt is not None:
+                limit = nxt - float(seg.get("start", 0.0)) - 0.02
+                actual = self._probe_wav_duration_seconds(polished[idx])
+                if limit > 0.2 and actual > limit + 0.03:
+                    polished[idx] = self._truncate_wav_with_fade(
+                        polished[idx], os.path.join(tmp_dir, f"seg_{idx:04d}_elastic_guard.wav"), limit,
+                    )
+                    stats["overflow_faded"] += 1
+                    seg["elastic_overflow"] = round(actual - limit, 3)
+            seg["elastic_speed"] = round(speed, 3)
+            seg["action_taken"] = "elastic_fit"
+            metrics = dict(seg.get("_tts_metrics") or {})
+            metrics["action_taken"] = "elastic_fit"
+            metrics["elastic_speed"] = round(speed, 3)
+            seg["_tts_metrics"] = metrics
+        print(
+            "[Elastic Timing] "
+            f"faster={stats['faster']}, slower={stats['slower']}, natural={stats['natural']}, "
+            f"overflow_faded={stats['overflow_faded']}, limits=[{min_speed:.2f}x, {max_speed:.2f}x]"
+        )
+        return polished
+
     def _synthesize_segment_wavs(
         self,
         *,
@@ -1533,21 +1762,32 @@ class VoiceWorkflow:
             normalizer_signature=normalizer_signature,
         )
         self._save_pre_speed_ratios(segments=segments, wavs=wavs)
-        wavs = self._apply_safe_timing_polish(
-            segments=segments,
-            wavs=wavs,
-            tmp_dir=tmp_dir,
-            voice_speed=residual_speed,
-            sync_mode=timing_sync_mode,
-        )
-        self._log_segment_fit_metrics(segments=segments, wavs=wavs)
+        sync_key = self._normalize_sync_mode(timing_sync_mode)
+        print(f"[Voice Workflow] Timing sync mode: {timing_sync_mode!r} -> {sync_key}")
+        if sync_key == "elastic":
+            wavs = self._apply_elastic_timing(
+                segments=segments,
+                wavs=wavs,
+                tmp_dir=tmp_dir,
+                voice_speed=residual_speed,
+            )
+            self._log_segment_fit_metrics(segments=segments, wavs=wavs)
+        else:
+            wavs = self._apply_safe_timing_polish(
+                segments=segments,
+                wavs=wavs,
+                tmp_dir=tmp_dir,
+                voice_speed=residual_speed,
+                sync_mode=sync_key,
+            )
+            self._log_segment_fit_metrics(segments=segments, wavs=wavs)
 
-        segments, wavs = self._apply_deficit_timing_polish(
-            segments=segments,
-            wavs=wavs,
-            tmp_dir=tmp_dir,
-            sync_mode=timing_sync_mode,
-        )
+            segments, wavs = self._apply_deficit_timing_polish(
+                segments=segments,
+                wavs=wavs,
+                tmp_dir=tmp_dir,
+                sync_mode=sync_key,
+            )
         self._extend_segment_ends_to_audio(segments=segments, wavs=wavs)
 
         synth_elapsed = time.perf_counter() - synth_started
